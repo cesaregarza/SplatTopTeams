@@ -1,0 +1,40 @@
+version: '3.9'
+services:
+  teams-api:
+    build:
+      context: .
+      dockerfile: dockerfiles/dockerfile.api
+    environment:
+      # Prefer a docker-specific override, otherwise use the app DB URL from .env.
+      # Final fallback targets the local compose postgres service.
+      RANKINGS_DATABASE_URL: ${RANKINGS_DATABASE_URL_DOCKER:-${RANKINGS_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/rankings_db}}
+      RANKINGS_DB_SCHEMA: ${RANKINGS_DB_SCHEMA:-comp_rankings}
+      API_RL_PER_MIN: "120"
+      CORS_ORIGINS: "*"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+
+  teams-frontend:
+    build:
+      context: .
+      dockerfile: dockerfiles/dockerfile.frontend
+    ports:
+      - "3000:8080"
+    depends_on:
+      - teams-api
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rankings_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - teams_pg_data:/var/lib/postgresql/data
+
+volumes:
+  teams_pg_data:

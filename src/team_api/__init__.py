@@ -1,0 +1,1 @@
+"""SplatTopTeams FastAPI service."""
