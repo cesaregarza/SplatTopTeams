@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -464,20 +464,63 @@ def rank_similar_teams(
     cluster_map: Dict[int, Dict[str, object]],
     top_n: int,
     min_relevance: float = 0.0,
+    precomputed_finals: Optional[np.ndarray] = None,
+    precomputed_semantics: Optional[np.ndarray] = None,
+    precomputed_identities: Optional[np.ndarray] = None,
+    precomputed_index: Optional[Dict[int, int]] = None,
 ) -> Dict[str, object]:
-    embeddings = _normalize_embeddings(embeddings)
-    if not embeddings:
-        return {"query": {}, "results": []}
+    embedding_rows = list(embeddings)
+    use_precomputed = (
+        bool(embedding_rows)
+        and precomputed_finals is not None
+        and precomputed_semantics is not None
+        and precomputed_identities is not None
+    )
 
-    index = {row.team_id: i for i, row in enumerate(embeddings)}
+    finals: np.ndarray
+    semantics: np.ndarray
+    identities: np.ndarray
+    index: Dict[int, int]
+    if use_precomputed:
+        finals = np.asarray(precomputed_finals, dtype=np.float64)
+        semantics = np.asarray(precomputed_semantics, dtype=np.float64)
+        identities = np.asarray(precomputed_identities, dtype=np.float64)
+        if (
+            finals.ndim != 2
+            or semantics.ndim != 2
+            or identities.ndim != 2
+            or finals.shape[0] != len(embedding_rows)
+            or semantics.shape[0] != len(embedding_rows)
+            or identities.shape[0] != len(embedding_rows)
+        ):
+            use_precomputed = False
+        else:
+            index = (
+                {
+                    int(team_id): int(idx)
+                    for team_id, idx in precomputed_index.items()
+                    if 0 <= int(idx) < len(embedding_rows)
+                }
+                if precomputed_index
+                else {row.team_id: i for i, row in enumerate(embedding_rows)}
+            )
+
+    if not use_precomputed:
+        embedding_rows = _normalize_embeddings(embedding_rows)
+        if not embedding_rows:
+            return {"query": {}, "results": []}
+        index = {row.team_id: i for i, row in enumerate(embedding_rows)}
+        finals = np.stack([row.final_vector for row in embedding_rows], axis=0)
+        semantics = np.stack([row.semantic_vector for row in embedding_rows], axis=0)
+        identities = np.stack([row.identity_vector for row in embedding_rows], axis=0)
+
     target_idx = [index[tid] for tid in target_team_ids if tid in index]
     if not target_idx:
         return {"query": {"matched_team_ids": []}, "results": []}
 
-    finals = np.stack([row.final_vector for row in embeddings], axis=0)
-    semantics = np.stack([row.semantic_vector for row in embeddings], axis=0)
-    identities = np.stack([row.identity_vector for row in embeddings], axis=0)
-    weights = np.array([embeddings[i].lineup_count for i in target_idx], dtype=np.float64)
+    weights = np.array(
+        [embedding_rows[i].lineup_count for i in target_idx], dtype=np.float64
+    )
 
     query_final = _weighted_centroid(finals[target_idx], weights)
     query_sem = _weighted_centroid(semantics[target_idx], weights)
@@ -499,7 +542,7 @@ def rank_similar_teams(
     filtered = filtered[:top_n]
 
     for rank, idx in enumerate(filtered, start=1):
-        row = embeddings[int(idx)]
+        row = embedding_rows[int(idx)]
         cluster = cluster_map.get(row.team_id)
 
         top_lineup_players: List[Dict[str, object]] = []
@@ -588,8 +631,8 @@ def rank_similar_teams(
 
     return {
         "query": {
-            "matched_team_ids": [embeddings[i].team_id for i in target_idx],
-            "matched_team_names": [embeddings[i].team_name for i in target_idx],
+            "matched_team_ids": [embedding_rows[i].team_id for i in target_idx],
+            "matched_team_names": [embedding_rows[i].team_name for i in target_idx],
         },
         "results": results,
     }

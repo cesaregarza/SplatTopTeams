@@ -26,6 +26,7 @@ MIRROR_ALLOW_MISSING ?= 1
 	refresh \
 	refresh-local \
 	refresh-local-from-remote \
+	benchmark-store-perf \
 	test \
 	compose-up \
 	compose-up-local \
@@ -50,6 +51,7 @@ help:
 	@echo "  make refresh          Run embedding refresh on current DB (DAYS=$(DAYS))"
 	@echo "  make refresh-local    Run refresh against local postgres at localhost:5432"
 	@echo "  make refresh-local-from-remote  Read source from .env DB, write snapshots to local postgres"
+	@echo "  make benchmark-store-perf  Benchmark store search/analytics latency against local DB"
 	@echo "  make mirror-analytics-tables  Mirror source tables into local postgres (reads .env)"
 	@echo "  make compose-mirror-analytics-tables  Mirror source tables via API container into local compose postgres"
 	@echo "  make test             Run backend tests"
@@ -140,6 +142,11 @@ refresh-local-from-remote: install
 	  --target-db-url "$(LOCAL_DB_URL)" \
 	  --schema "$${RANKINGS_DB_SCHEMA:-comp_rankings}" \
 	  --days $(DAYS)
+
+benchmark-store-perf: install
+	$(UV) run python scripts/benchmark_store_perf.py \
+	  --db-url "$(LOCAL_DB_URL)" \
+	  --schema "comp_rankings"
 
 test: install
 	$(UV) run pytest -q

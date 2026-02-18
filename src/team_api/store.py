@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -134,6 +136,18 @@ class EmbeddingRow:
     tournament_count: int = 0
 
 
+@dataclass
+class EmbeddingSnapshotCacheEntry:
+    snapshot_id: int
+    rows: List[EmbeddingRow]
+    finals: np.ndarray
+    semantics: np.ndarray
+    identities: np.ndarray
+    lineup_counts: np.ndarray
+    index_by_team_id: Dict[int, int]
+    built_at_ms: int
+
+
 class TeamSearchStore:
     _MATCH_SCORE_CANDIDATES = (
         ("team1_score", "team2_score"),
@@ -154,6 +168,10 @@ class TeamSearchStore:
         self._match_score_columns_cache: Optional[tuple[str, str] | None] = None
         self._player_rankings_rank_column: Optional[str] = None
         self._player_rankings_rank_column_checked: bool = False
+        self._cache_lock = threading.RLock()
+        self._embedding_snapshot_cache: Optional[EmbeddingSnapshotCacheEntry] = None
+        self._cluster_map_cache: Dict[tuple[int, str], Dict[int, Dict[str, Any]]] = {}
+        self._tournament_count_cache: Dict[tuple[int, int], int] = {}
 
     @staticmethod
     def _rank_similar_teams(
@@ -162,15 +180,21 @@ class TeamSearchStore:
         cluster_map: Dict[int, Dict[str, object]],
         top_n: int,
         min_relevance: float,
+        cache_entry: Optional[EmbeddingSnapshotCacheEntry] = None,
     ) -> Dict[str, object]:
         from team_api.search_logic import rank_similar_teams
 
+        use_cached_arrays = cache_entry is not None and embeddings is cache_entry.rows
         return rank_similar_teams(
             embeddings=embeddings,
             target_team_ids=target_team_ids,
             cluster_map=cluster_map,
             top_n=top_n,
             min_relevance=min_relevance,
+            precomputed_finals=cache_entry.finals if use_cached_arrays else None,
+            precomputed_semantics=cache_entry.semantics if use_cached_arrays else None,
+            precomputed_identities=cache_entry.identities if use_cached_arrays else None,
+            precomputed_index=cache_entry.index_by_team_id if use_cached_arrays else None,
         )
 
     @staticmethod
@@ -1276,15 +1300,51 @@ class TeamSearchStore:
     def _hydrate_tournament_counts(
         self, snapshot_id: int, rows: List[Dict[str, Any]]
     ) -> None:
-        missing = [
-            int(row["team_id"])
-            for row in rows
-            if int(row.get("tournament_count") or 0) <= 0
-        ]
+        sid = int(snapshot_id)
+        missing: List[int] = []
+        cached_updates = 0
+        for row in rows:
+            if int(row.get("tournament_count") or 0) > 0:
+                continue
+            team_id = int(row["team_id"])
+            cache_key = (sid, team_id)
+            with self._cache_lock:
+                cached_count = self._tournament_count_cache.get(cache_key)
+            if cached_count is not None and int(cached_count) > 0:
+                row["tournament_count"] = int(cached_count)
+                cached_updates += 1
+            else:
+                missing.append(team_id)
+
+        if cached_updates:
+            logger.debug(
+                "tournament_count_cache_hit schema=%s snapshot_id=%s teams=%s",
+                self.schema,
+                sid,
+                cached_updates,
+            )
+
         if not missing:
             return
 
-        hydrated = self._fetch_tournament_counts(snapshot_id, missing)
+        start = time.perf_counter()
+        hydrated = self._fetch_tournament_counts(sid, missing)
+        fetch_ms = (time.perf_counter() - start) * 1000.0
+        if hydrated:
+            with self._cache_lock:
+                for team_id, tournament_count in hydrated.items():
+                    self._tournament_count_cache[(sid, int(team_id))] = int(
+                        tournament_count
+                    )
+        logger.debug(
+            "tournament_count_hydrate schema=%s snapshot_id=%s queried=%s resolved=%s fetch_ms=%.1f",
+            self.schema,
+            sid,
+            len(missing),
+            len(hydrated),
+            fetch_ms,
+        )
+
         if not hydrated:
             # As a safe fallback, at least surface teams with match history as having
             # participated in one tournament when exact tournament counting can’t be resolved.
@@ -1631,15 +1691,27 @@ class TeamSearchStore:
         consolidate: bool = True,
         consolidate_min_overlap: float = 0.8,
     ) -> Dict[str, object]:
+        start_total = time.perf_counter()
         target_ids = self.match_targets(
             snapshot_id=snapshot_id,
             query=query,
             limit=max(1, min(int(top_n), 60)),
         )
-        cluster_map = self.load_cluster_map(snapshot_id, cluster_mode) if include_clusters else {}
+        cluster_map = (
+            self._get_cached_cluster_map(snapshot_id, cluster_mode)
+            if include_clusters
+            else {}
+        )
 
         query_rows = self._fetch_embeddings_by_team_ids(snapshot_id, target_ids)
         if not query_rows:
+            logger.debug(
+                "team_search schema=%s snapshot_id=%s mode=empty query=%r elapsed_ms=%.1f",
+                self.schema,
+                int(snapshot_id),
+                query,
+                (time.perf_counter() - start_total) * 1000.0,
+            )
             return {
                 "query": {"matched_team_ids": [], "matched_team_names": []},
                 "results": [],
@@ -1664,15 +1736,26 @@ class TeamSearchStore:
                     ranked["results"],
                     min_overlap=consolidate_min_overlap,
                 )
+            logger.debug(
+                "team_search schema=%s snapshot_id=%s mode=ann query=%r targets=%s results=%s elapsed_ms=%.1f",
+                self.schema,
+                int(snapshot_id),
+                query,
+                len(target_ids),
+                len(ranked.get("results", [])),
+                (time.perf_counter() - start_total) * 1000.0,
+            )
             return ranked
 
-        all_rows = self.load_embeddings(snapshot_id)
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        all_rows = cache_entry.rows
         ranked = self._rank_similar_teams(
             embeddings=all_rows,
             target_team_ids=target_ids,
             cluster_map=cluster_map,
             top_n=top_n,
             min_relevance=min_relevance,
+            cache_entry=cache_entry,
         )
         if consolidate:
             from team_api.search_logic import consolidate_ranked_results
@@ -1681,6 +1764,15 @@ class TeamSearchStore:
                 ranked["results"],
                 min_overlap=consolidate_min_overlap,
             )
+        logger.debug(
+            "team_search schema=%s snapshot_id=%s mode=cache query=%r targets=%s results=%s elapsed_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            query,
+            len(target_ids),
+            len(ranked.get("results", [])),
+            (time.perf_counter() - start_total) * 1000.0,
+        )
         return ranked
 
     def _fetch_rows(
@@ -1911,6 +2003,119 @@ class TeamSearchStore:
             normalized_rows.append(r_obj)
         return normalized_rows
 
+    def _build_snapshot_cache_entry(
+        self, snapshot_id: int, rows: List[EmbeddingRow]
+    ) -> EmbeddingSnapshotCacheEntry:
+        if rows:
+            finals = np.stack([row.final_vector for row in rows], axis=0)
+            semantics = np.stack([row.semantic_vector for row in rows], axis=0)
+            identities = np.stack([row.identity_vector for row in rows], axis=0)
+            lineup_counts = np.asarray(
+                [row.lineup_count for row in rows], dtype=np.float64
+            )
+        else:
+            finals = np.empty((0, 0), dtype=np.float64)
+            semantics = np.empty((0, 0), dtype=np.float64)
+            identities = np.empty((0, 0), dtype=np.float64)
+            lineup_counts = np.empty((0,), dtype=np.float64)
+
+        return EmbeddingSnapshotCacheEntry(
+            snapshot_id=int(snapshot_id),
+            rows=rows,
+            finals=finals,
+            semantics=semantics,
+            identities=identities,
+            lineup_counts=lineup_counts,
+            index_by_team_id={int(row.team_id): idx for idx, row in enumerate(rows)},
+            built_at_ms=int(time.time() * 1000),
+        )
+
+    def _invalidate_snapshot_cache(self, snapshot_id: Optional[int] = None) -> None:
+        with self._cache_lock:
+            if snapshot_id is None:
+                self._embedding_snapshot_cache = None
+                self._cluster_map_cache.clear()
+                self._tournament_count_cache.clear()
+                return
+
+            sid = int(snapshot_id)
+            if (
+                self._embedding_snapshot_cache is not None
+                and int(self._embedding_snapshot_cache.snapshot_id) == sid
+            ):
+                self._embedding_snapshot_cache = None
+
+            self._cluster_map_cache = {
+                key: value
+                for key, value in self._cluster_map_cache.items()
+                if int(key[0]) != sid
+            }
+            self._tournament_count_cache = {
+                key: value
+                for key, value in self._tournament_count_cache.items()
+                if int(key[0]) != sid
+            }
+
+    def _get_cached_snapshot_entry(self, snapshot_id: int) -> EmbeddingSnapshotCacheEntry:
+        sid = int(snapshot_id)
+        with self._cache_lock:
+            cached = self._embedding_snapshot_cache
+            if cached is not None and int(cached.snapshot_id) == sid:
+                logger.debug(
+                    "snapshot_cache_hit schema=%s snapshot_id=%s teams=%s",
+                    self.schema,
+                    sid,
+                    len(cached.rows),
+                )
+                return cached
+
+        start = time.perf_counter()
+        rows = self.load_embeddings(sid)
+        built = self._build_snapshot_cache_entry(sid, rows)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        with self._cache_lock:
+            self._embedding_snapshot_cache = built
+            # Keep auxiliary caches bounded to the active snapshot.
+            self._cluster_map_cache = {
+                key: value
+                for key, value in self._cluster_map_cache.items()
+                if int(key[0]) == sid
+            }
+            self._tournament_count_cache = {
+                key: value
+                for key, value in self._tournament_count_cache.items()
+                if int(key[0]) == sid
+            }
+        logger.debug(
+            "snapshot_cache_miss schema=%s snapshot_id=%s teams=%s build_ms=%.1f",
+            self.schema,
+            sid,
+            len(rows),
+            elapsed_ms,
+        )
+        return built
+
+    def _get_cached_cluster_map(
+        self, snapshot_id: int, profile: str
+    ) -> Dict[int, Dict[str, Any]]:
+        sid = int(snapshot_id)
+        key = (sid, str(profile))
+        with self._cache_lock:
+            cached = self._cluster_map_cache.get(key)
+            if cached is not None:
+                return cached
+
+        cluster_map = self.load_cluster_map(sid, profile, use_cache=False)
+        with self._cache_lock:
+            # Keep only cluster maps for the active snapshot.
+            self._cluster_map_cache = {
+                cache_key: value
+                for cache_key, value in self._cluster_map_cache.items()
+                if int(cache_key[0]) == sid
+            }
+            self._cluster_map_cache[key] = cluster_map
+        return cluster_map
+
     def match_targets(
         self, snapshot_id: int, query: str, limit: int = 25
     ) -> List[int]:
@@ -2011,8 +2216,17 @@ class TeamSearchStore:
         return fallback_ids
 
     def load_cluster_map(
-        self, snapshot_id: int, profile: str
+        self, snapshot_id: int, profile: str, *, use_cache: bool = True
     ) -> Dict[int, Dict[str, Any]]:
+        sid = int(snapshot_id)
+        mode = str(profile)
+        cache_key = (sid, mode)
+        if use_cache:
+            with self._cache_lock:
+                cached = self._cluster_map_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         sql = f"""
             SELECT team_id, cluster_id, cluster_size, representative_team_name
             FROM {self.schema}.team_search_clusters
@@ -2021,10 +2235,10 @@ class TeamSearchStore:
         """
         rows = self._fetch_rows(
             sql,
-            {"snapshot_id": int(snapshot_id), "profile": profile},
+            {"snapshot_id": sid, "profile": mode},
             missing_default=[],
         )
-        return {
+        resolved = {
             int(row["team_id"]): {
                 "cluster_id": int(row["cluster_id"]),
                 "cluster_size": int(row["cluster_size"]),
@@ -2032,6 +2246,15 @@ class TeamSearchStore:
             }
             for row in rows
         }
+        if use_cache:
+            with self._cache_lock:
+                self._cluster_map_cache = {
+                    key: value
+                    for key, value in self._cluster_map_cache.items()
+                    if int(key[0]) == sid
+                }
+                self._cluster_map_cache[cache_key] = resolved
+        return resolved
 
     def list_clusters(
         self, snapshot_id: int, profile: str, query: Optional[str], limit: int
@@ -2235,8 +2458,10 @@ class TeamSearchStore:
     ) -> Dict[str, Any]:
         from team_api.analytics_logic import compute_overview
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
+        start_total = time.perf_counter()
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
         overview = compute_overview(
             embeddings,
             cluster_map,
@@ -2244,12 +2469,20 @@ class TeamSearchStore:
             volatile_limit=volatile_limit,
         )
         run = self.get_refresh_run(snapshot_id)
-        return {
+        payload = {
             "snapshot_id": snapshot_id,
             "cluster_mode": profile,
             "run": run,
             **overview,
         }
+        logger.debug(
+            "analytics_overview schema=%s snapshot_id=%s profile=%s elapsed_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            profile,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload
 
     def analytics_matchups(
         self,
@@ -2822,9 +3055,11 @@ class TeamSearchStore:
     ) -> Dict[str, Any]:
         from team_api.analytics_logic import compute_roster_diversity_candidates
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
-        return compute_roster_diversity_candidates(
+        start_total = time.perf_counter()
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
+        result = compute_roster_diversity_candidates(
             embeddings=embeddings,
             cluster_map=cluster_map,
             min_similarity=float(min_similarity),
@@ -2832,6 +3067,14 @@ class TeamSearchStore:
             min_cluster_size=max(2, int(min_cluster_size)),
             limit=max(1, int(limit)),
         )
+        logger.debug(
+            "analytics_roster schema=%s snapshot_id=%s profile=%s elapsed_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            profile,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return result
 
     def analytics_team_lab(
         self,
@@ -2843,8 +3086,9 @@ class TeamSearchStore:
     ) -> Optional[Dict[str, Any]]:
         from team_api.analytics_logic import build_team_lab
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
 
         sql = f"""
             SELECT
@@ -2892,8 +3136,9 @@ class TeamSearchStore:
     ) -> Optional[Dict[str, Any]]:
         from team_api.analytics_logic import build_blended_neighbors
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
         result = build_blended_neighbors(
             team_id=int(team_id),
             embeddings=embeddings,
@@ -2918,19 +3163,29 @@ class TeamSearchStore:
     ) -> Dict[str, Any]:
         from team_api.analytics_logic import compute_outliers
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
+        start_total = time.perf_counter()
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
         outliers = compute_outliers(
             embeddings,
             cluster_map,
             limit=max(1, int(limit)),
         )
-        return {
+        payload = {
             "snapshot_id": snapshot_id,
             "cluster_mode": profile,
             "count": len(outliers),
             "outliers": outliers,
         }
+        logger.debug(
+            "analytics_outliers schema=%s snapshot_id=%s profile=%s elapsed_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            profile,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload
 
     def analytics_space(
         self,
@@ -2941,18 +3196,28 @@ class TeamSearchStore:
     ) -> Dict[str, Any]:
         from team_api.analytics_logic import compute_space_projection
 
-        embeddings = self.load_embeddings(snapshot_id)
-        cluster_map = self.load_cluster_map(snapshot_id, profile)
+        start_total = time.perf_counter()
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        embeddings = cache_entry.rows
+        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
         projection = compute_space_projection(
             embeddings,
             cluster_map,
             max_points=max(50, min(int(max_points), 3000)),
         )
-        return {
+        payload = {
             "snapshot_id": snapshot_id,
             "cluster_mode": profile,
             **projection,
         }
+        logger.debug(
+            "analytics_space schema=%s snapshot_id=%s profile=%s elapsed_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            profile,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload
 
     def analytics_drift(
         self,
@@ -2964,6 +3229,7 @@ class TeamSearchStore:
     ) -> Optional[Dict[str, Any]]:
         from team_api.analytics_logic import compute_snapshot_drift
 
+        start_total = time.perf_counter()
         snapshots = self.list_completed_snapshots(limit=10)
         if not snapshots:
             return None
@@ -2980,7 +3246,7 @@ class TeamSearchStore:
                     break
 
         if previous_snapshot_id is None:
-            return {
+            payload = {
                 "current_snapshot_id": int(current_snapshot_id),
                 "previous_snapshot_id": None,
                 "summary": {
@@ -2996,13 +3262,26 @@ class TeamSearchStore:
                 "top_embedding_movers": [],
                 "top_volatility_shifts": [],
             }
+            logger.debug(
+                "analytics_drift schema=%s profile=%s current=%s previous=%s elapsed_ms=%.1f",
+                self.schema,
+                profile,
+                int(current_snapshot_id),
+                None,
+                (time.perf_counter() - start_total) * 1000.0,
+            )
+            return payload
 
-        current_embeddings = self.load_embeddings(int(current_snapshot_id))
-        previous_embeddings = self.load_embeddings(int(previous_snapshot_id))
-        current_cluster_map = self.load_cluster_map(
+        current_embeddings = self._get_cached_snapshot_entry(
+            int(current_snapshot_id)
+        ).rows
+        previous_embeddings = self._get_cached_snapshot_entry(
+            int(previous_snapshot_id)
+        ).rows
+        current_cluster_map = self._get_cached_cluster_map(
             int(current_snapshot_id), profile
         )
-        previous_cluster_map = self.load_cluster_map(
+        previous_cluster_map = self._get_cached_cluster_map(
             int(previous_snapshot_id), profile
         )
 
@@ -3015,7 +3294,16 @@ class TeamSearchStore:
             previous_cluster_map=previous_cluster_map,
             top_movers=max(1, int(top_movers)),
         )
-        return {
+        payload = {
             "cluster_mode": profile,
             **drift,
         }
+        logger.debug(
+            "analytics_drift schema=%s profile=%s current=%s previous=%s elapsed_ms=%.1f",
+            self.schema,
+            profile,
+            int(current_snapshot_id),
+            int(previous_snapshot_id),
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload

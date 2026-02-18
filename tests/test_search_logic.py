@@ -38,6 +38,32 @@ def test_rank_similar_teams_orders_by_similarity():
     assert ordered_ids[2] == 3
 
 
+def test_rank_similar_teams_uses_precomputed_vectors_when_provided():
+    rows = [
+        _row(1, "Alpha", [1.0, 0.0]),
+        _row(2, "Bravo", [0.9, 0.1]),
+        _row(3, "Charlie", [0.0, 1.0]),
+    ]
+    finals = np.stack([row.final_vector for row in rows], axis=0)
+    semantics = np.stack([row.semantic_vector for row in rows], axis=0)
+    identities = np.stack([row.identity_vector for row in rows], axis=0)
+    index = {row.team_id: i for i, row in enumerate(rows)}
+
+    out = rank_similar_teams(
+        embeddings=rows,
+        target_team_ids=[1],
+        cluster_map={},
+        top_n=3,
+        precomputed_finals=finals,
+        precomputed_semantics=semantics,
+        precomputed_identities=identities,
+        precomputed_index=index,
+    )
+    ordered_ids = [r["team_id"] for r in out["results"]]
+    assert ordered_ids[:2] == [1, 2]
+    assert ordered_ids[2] == 3
+
+
 def test_rank_similar_teams_respects_relevance_threshold():
     rows = [
         _row(1, "Alpha", [1.0, 0.0]),
