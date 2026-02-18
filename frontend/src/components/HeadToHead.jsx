@@ -141,6 +141,205 @@ function formatScorePair(sideA, sideB) {
   return `${formatMatchScore(sideA)} – ${formatMatchScore(sideB)}`;
 }
 
+function normalizeText(value) {
+  const text = String(value || '').trim();
+  return text || null;
+}
+
+function isStageLikeLabel(value) {
+  const normalized = normalizeText(value)?.toLowerCase();
+  if (!normalized) return false;
+
+  return [
+    'group',
+    'group stage',
+    'qualifier',
+    'qualifiers',
+    'top cut',
+    'winners',
+    'losers',
+    'final',
+    'semi',
+    'upper bracket',
+    'lower bracket',
+    'bracket',
+    'single elimination',
+    'double elimination',
+    'swiss',
+    'robin',
+    'round',
+    'elimination',
+  ].some((token) => normalized.includes(token));
+}
+
+function normalizeMapMode(value, mapsCount = null) {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+
+  const lowered = normalized.toLowerCase().replace(/[_-]+/g, ' ').trim();
+  if (isStageLikeLabel(lowered)) return null;
+
+  if (
+    lowered.includes('best of') ||
+    lowered === 'bestof' ||
+    /^bo\s*\d+$/i.test(lowered)
+  ) {
+    return mapsCount ? `Best of ${mapsCount}` : 'Best of';
+  }
+
+  if (
+    lowered.includes('play all') ||
+    lowered === 'playall'
+  ) {
+    return mapsCount ? `Play all ${mapsCount}` : 'Play all';
+  }
+
+  return null;
+}
+
+const MODE_LABEL_BY_TOKEN = {
+  SZ: 'Splat Zones',
+  TC: 'Tower Control',
+  RM: 'Rainmaker',
+  CB: 'Clam Blitz',
+  TW: 'Turf War',
+};
+const SHOW_MAP_RULESET_COLUMN = false;
+
+function normalizeTagList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => normalizeText(item))
+      .filter((item) => Boolean(item));
+  }
+
+  const normalized = normalizeText(value);
+  if (!normalized) return [];
+
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(normalized);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) => normalizeText(item))
+          .filter((item) => Boolean(item));
+      }
+    } catch {
+      return [];
+    }
+  }
+
+  return normalized
+    .split(/[\s,]+/)
+    .map((item) => normalizeText(item))
+    .filter((item) => Boolean(item));
+}
+
+function detectModeToken(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+
+  const upper = normalized.toUpperCase();
+  if (upper.includes('SPLAT ZONES')) return 'SZ';
+  if (upper.includes('TOWER CONTROL')) return 'TC';
+  if (upper.includes('RAINMAKER')) return 'RM';
+  if (upper.includes('CLAM BLITZ')) return 'CB';
+  if (upper.includes('TURF WAR')) return 'TW';
+
+  const parts = upper.split(/[^A-Z0-9]+/).filter(Boolean);
+  for (const part of parts) {
+    if (MODE_LABEL_BY_TOKEN[part]) {
+      return part;
+    }
+  }
+  return null;
+}
+
+function resolveGameModeLabel(mapMode, fallbackMode, fallbackStyle, tournamentTags) {
+  const candidates = [
+    mapMode,
+    fallbackMode,
+    fallbackStyle,
+    ...normalizeTagList(tournamentTags),
+  ];
+
+  for (const candidate of candidates) {
+    const token = detectModeToken(candidate);
+    if (token && MODE_LABEL_BY_TOKEN[token]) {
+      return MODE_LABEL_BY_TOKEN[token];
+    }
+  }
+
+  return null;
+}
+
+const MATCH_SORT_FIELDS = [
+  { value: 'time|desc', label: 'Match time · newest first' },
+  { value: 'time|asc', label: 'Match time · oldest first' },
+  { value: 'match_id|desc', label: 'Match ID · high to low' },
+  { value: 'match_id|asc', label: 'Match ID · low to high' },
+  { value: 'round|asc', label: 'Round · low to high' },
+  { value: 'round|desc', label: 'Round · high to low' },
+  { value: 'tournament|asc', label: 'Tournament · A to Z' },
+  { value: 'tournament|desc', label: 'Tournament · Z to A' },
+  { value: 'tier|desc', label: 'Tournament tier · strongest first' },
+  { value: 'tier|asc', label: 'Tournament tier · weakest first' },
+  { value: 'mode|asc', label: 'Map Slot / Ruleset · A to Z' },
+  { value: 'mode|desc', label: 'Map Slot / Ruleset · Z to A' },
+  { value: 'winner|asc', label: 'Winner · A to Z' },
+  { value: 'winner|desc', label: 'Winner · Z to A' },
+  { value: 'score|desc', label: 'Match score · A higher' },
+  { value: 'score|asc', label: 'Match score · A lower' },
+];
+
+function getTierOrderLabel(score, tierId) {
+  const tier = resolveTournamentTier(score, tierId);
+  return tier && typeof tier.id === 'string'
+    ? tier.id
+    : 'unscored';
+}
+
+function tierSortPriority(tierId) {
+  if (tierId === 'x') return 0;
+  if (tierId === 's_plus') return 1;
+  if (tierId === 's') return 2;
+  if (tierId === 'a_plus') return 3;
+  if (tierId === 'a') return 4;
+  if (tierId === 'a_minus') return 5;
+  return 6;
+}
+
+function formatRoundMapMode(mapName, mapMode, fallbackMode, fallbackStyle, tournamentTags, mapIndex, mapCount) {
+  const normalizedMap = normalizeText(mapName);
+  const filteredMapName = isStageLikeLabel(normalizedMap) ? null : normalizedMap;
+  const setFormat = normalizeMapMode(mapMode, mapCount)
+    || normalizeMapMode(fallbackMode, mapCount)
+    || normalizeMapMode(fallbackStyle, mapCount);
+  const gameMode = resolveGameModeLabel(
+    mapMode,
+    fallbackMode,
+    fallbackStyle,
+    tournamentTags,
+  );
+
+  const details = [gameMode, setFormat].filter((value) => Boolean(value)).join(' / ');
+
+  if (filteredMapName && details) {
+    return mapIndex
+      ? `Map ${mapIndex}: ${filteredMapName} / ${details}`
+      : `${filteredMapName} / ${details}`;
+  }
+  if (details && mapIndex) {
+    return `Map ${mapIndex} / ${details}`;
+  }
+  if (mapIndex) {
+    return filteredMapName
+      ? `${filteredMapName} (${mapIndex})`
+      : `Map ${mapIndex}`;
+  }
+  return filteredMapName || details || 'Unknown';
+}
+
 function buildRosterList(raw) {
   if (!Array.isArray(raw) || !raw.length) return [];
   const rows = [];
@@ -283,6 +482,157 @@ function compareTeamRows(rows, sortBy, direction) {
   return sorted;
 }
 
+function compareMatchRows(rows, sortBy, direction) {
+  const sorted = [...rows];
+  const sign = direction === 'desc' ? -1 : 1;
+
+  sorted.sort((left, right) => {
+    if (sortBy === 'time') {
+      const leftTime = toEpochMs(left.event_time_ms) || 0;
+      const rightTime = toEpochMs(right.event_time_ms) || 0;
+      if (leftTime !== rightTime) return (leftTime - rightTime) * sign;
+      return compareMatchIds(left, right);
+    }
+
+    if (sortBy === 'match_id') {
+      return compareMatchIds(left, right);
+    }
+
+    if (sortBy === 'round') {
+      const leftRound = safeIntOrNull(left.round_no);
+      const rightRound = safeIntOrNull(right.round_no);
+      if (leftRound !== rightRound) {
+        if (leftRound === null) return 1;
+        if (rightRound === null) return -1;
+        return (leftRound - rightRound) * sign;
+      }
+      const leftMapIndex = safeIntOrNull(left.map_index);
+      const rightMapIndex = safeIntOrNull(right.map_index);
+      if (leftMapIndex !== rightMapIndex) {
+        if (leftMapIndex === null) return 1;
+        if (rightMapIndex === null) return -1;
+        return (leftMapIndex - rightMapIndex) * sign;
+      }
+      return compareMatchIds(left, right);
+    }
+
+    if (sortBy === 'tournament') {
+      const leftTournament = normalizeText(
+        left.tournament_name
+          || (left.tournament_id !== null && left.tournament_id !== undefined
+            ? `Tournament ${safeInt(left.tournament_id)}`
+            : ''),
+      );
+      const rightTournament = normalizeText(
+        right.tournament_name
+          || (right.tournament_id !== null && right.tournament_id !== undefined
+            ? `Tournament ${safeInt(right.tournament_id)}`
+            : ''),
+      );
+      if (leftTournament !== rightTournament) {
+        if (!leftTournament) return 1;
+        if (!rightTournament) return -1;
+        return leftTournament.localeCompare(rightTournament) * sign;
+      }
+      return compareMatchIds(left, right);
+    }
+
+    if (sortBy === 'tier') {
+      const leftTier = getTierOrderLabel(safeFloat(left.tournament_score), left.tournament_score_tier_id);
+      const rightTier = getTierOrderLabel(safeFloat(right.tournament_score), right.tournament_score_tier_id);
+      if (leftTier !== rightTier) {
+        return (tierSortPriority(leftTier) - tierSortPriority(rightTier)) * sign;
+      }
+      return compareMatchIds(left, right);
+    }
+
+        if (sortBy === 'mode') {
+          const leftMode = normalizeText(
+            formatRoundMapMode(
+              left.round_map_name,
+              left.round_map_mode,
+              left.tournament_mode,
+              left.map_picking_style,
+              left.tournament_tags,
+              safeIntOrNull(left.map_index),
+              safeIntOrNull(left.round_maps_count),
+            ),
+          );
+          const rightMode = normalizeText(
+            formatRoundMapMode(
+              right.round_map_name,
+              right.round_map_mode,
+              right.tournament_mode,
+              right.map_picking_style,
+              right.tournament_tags,
+              safeIntOrNull(right.map_index),
+              safeIntOrNull(right.round_maps_count),
+            ),
+          );
+      if (leftMode !== rightMode) {
+        if (!leftMode) return 1;
+        if (!rightMode) return -1;
+        return leftMode.localeCompare(rightMode) * sign;
+      }
+      return compareMatchIds(left, right);
+    }
+
+    if (sortBy === 'winner') {
+      const leftWinner = normalizeText(
+        left.winner_side === 'team_a'
+          ? 'Team A'
+          : left.winner_side === 'team_b'
+            ? 'Team B'
+            : 'Unresolved',
+      );
+      const rightWinner = normalizeText(
+        right.winner_side === 'team_a'
+          ? 'Team A'
+          : right.winner_side === 'team_b'
+            ? 'Team B'
+            : 'Unresolved',
+      );
+      if (leftWinner !== rightWinner) {
+        return leftWinner.localeCompare(rightWinner) * sign;
+      }
+      const leftTime = toEpochMs(left.event_time_ms) || 0;
+      const rightTime = toEpochMs(right.event_time_ms) || 0;
+      return (leftTime - rightTime) * sign;
+    }
+
+    if (sortBy === 'score') {
+      const leftA = safeFloat(left.team_a_score);
+      const leftB = safeFloat(left.team_b_score);
+      const rightA = safeFloat(right.team_a_score);
+      const rightB = safeFloat(right.team_b_score);
+
+      const leftTotal = (leftA ?? 0) + (leftB ?? 0);
+      const rightTotal = (rightA ?? 0) + (rightB ?? 0);
+      if (leftTotal !== rightTotal) return (leftTotal - rightTotal) * sign;
+
+      if (leftA !== rightA) {
+        if (leftA === null) return 1 * sign;
+        if (rightA === null) return -1 * sign;
+        return (leftA - rightA) * sign;
+      }
+      return compareMatchIds(left, right);
+    }
+
+    return compareMatchIds(left, right);
+  });
+
+  function compareMatchIds(leftMatch, rightMatch) {
+    const leftMatchId = safeInt(leftMatch.match_id);
+    const rightMatchId = safeInt(rightMatch.match_id);
+    if (leftMatchId !== rightMatchId) return (leftMatchId - rightMatchId) * sign;
+    const leftTime = toEpochMs(leftMatch.event_time_ms) || 0;
+    const rightTime = toEpochMs(rightMatch.event_time_ms) || 0;
+    return (leftTime - rightTime) * sign;
+  }
+
+  return sorted;
+}
+
 export default function HeadToHead({
   selectedTeamAId = '',
   selectedTeamBId = '',
@@ -317,7 +667,17 @@ export default function HeadToHead({
   const [headToHeadSnapshotFilter, setHeadToHeadSnapshotFilter] = useState('');
   const [resultsSortBy, setResultsSortBy] = useState('relevance');
   const [resultsSortDir, setResultsSortDir] = useState('desc');
+  const [matchSortBy, setMatchSortBy] = useState('time');
+  const [matchSortDir, setMatchSortDir] = useState('desc');
   const [lastHeadToHeadSignature, setLastHeadToHeadSignature] = useState('');
+  const visibleMatchSortFields = useMemo(
+    () => (
+      SHOW_MAP_RULESET_COLUMN
+        ? MATCH_SORT_FIELDS
+        : MATCH_SORT_FIELDS.filter((option) => !option.value.startsWith('mode|'))
+    ),
+    [],
+  );
 
   useEffect(() => {
     const next = uniquePreserveOrder([
@@ -339,6 +699,13 @@ export default function HeadToHead({
     const snapshot = safeIntOrNull(selectedSnapshotId);
     setHeadToHeadSnapshotFilter(snapshot ? String(snapshot) : '');
   }, [selectedSnapshotId]);
+
+  useEffect(() => {
+    if (!SHOW_MAP_RULESET_COLUMN && matchSortBy === 'mode') {
+      setMatchSortBy('time');
+      setMatchSortDir('desc');
+    }
+  }, [matchSortBy]);
 
   const teamAIds = useMemo(() => uniquePreserveOrder(parseTeamIdList(teamAInput)), [teamAInput]);
   const teamBIds = useMemo(() => uniquePreserveOrder(parseTeamIdList(teamBInput)), [teamBInput]);
@@ -584,6 +951,47 @@ export default function HeadToHead({
 
   const summary = headToHeadPayload?.summary || {};
   const matches = headToHeadPayload?.matches || [];
+  const expandedMatchRows = useMemo(() => {
+    const out = [];
+    for (const match of matches) {
+      const rounds = Array.isArray(match.match_rounds) ? match.match_rounds : [];
+      const rowRounds = rounds.length
+        ? rounds
+        : [
+          {
+            round_no: null,
+            map_name: null,
+            map_mode: null,
+            team_a_score: match.team_a_score,
+            team_b_score: match.team_b_score,
+            winner_team_id: match.winner_team_id,
+            winner_side: match.winner_side,
+            is_synthetic_round: true,
+          },
+        ];
+
+      for (const [index, round] of rowRounds.entries()) {
+        out.push({
+          ...match,
+          round_no: round.round_no ?? null,
+          round_maps_count: round.maps_count ?? null,
+          round_map_name: round.map_name || null,
+          round_map_mode: round.map_mode || null,
+          team_a_score: safeFloat(round.team_a_score),
+          team_b_score: safeFloat(round.team_b_score),
+          winner_team_id: round.winner_team_id ?? match.winner_team_id ?? null,
+          winner_side: round.winner_side ?? match.winner_side ?? null,
+          row_id: `${match.match_id}-${round.round_id || round.round_no || `syn-${index}`}`,
+          is_synthetic_round: Boolean(round.is_synthetic_round),
+        });
+      }
+    }
+    return out;
+  }, [matches]);
+  const sortedMatches = useMemo(() => {
+    if (!expandedMatchRows.length) return [];
+    return compareMatchRows(expandedMatchRows, matchSortBy, matchSortDir);
+  }, [expandedMatchRows, matchSortBy, matchSortDir]);
   const snapshotIdLabel = safeIntOrNull(headToHeadPayload?.snapshot_id) || safeIntOrNull(headToHeadSnapshotFilter);
   const snapshotLabel = snapshotIdLabel !== null ? snapshotIdLabel : 'n/a';
   const teamAWins = safeInt(summary.team_a_wins);
@@ -621,6 +1029,7 @@ export default function HeadToHead({
   const teamBRepresentativeGroup = teamBSummary.groups[0]?.name || teamBDisplayName || 'Team B';
   const teamAWinRateText = percent(aWinRate);
   const teamBWinRateText = percent(bWinRate);
+  const matchTableColSpan = SHOW_MAP_RULESET_COLUMN ? 9 : 8;
 
   const renderMatchRoster = (players, heading) => {
     const roster = buildRosterList(players);
@@ -1229,11 +1638,33 @@ export default function HeadToHead({
           </div>
 
           <div className="table-wrap">
-              <table className="head-to-head-table">
+            <div className="h2h-match-sort">
+              <label htmlFor="head-to-head-match-sort" className="field-label">Sort matches</label>
+              <select
+                id="head-to-head-match-sort"
+                className="input"
+                value={`${matchSortBy}|${matchSortDir}`}
+                onChange={(event) => {
+                  const [sortBy, direction] = event.target.value.split('|');
+                  setMatchSortBy(sortBy);
+                  setMatchSortDir(direction);
+                }}
+              >
+                {visibleMatchSortFields.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <table className="head-to-head-table h2h-match-table">
               <thead>
                       <tr>
                         <th>Match</th>
+                        <th>Round</th>
                         <th>Tournament</th>
+                        {SHOW_MAP_RULESET_COLUMN ? <th>Map Slot / Ruleset</th> : null}
                         <th>Tournament Tier</th>
                         <th>Score</th>
                         <th>Winner</th>
@@ -1242,8 +1673,8 @@ export default function HeadToHead({
                     </tr>
               </thead>
               <tbody>
-                {matches.length ? (
-                    matches.map((match) => {
+                {sortedMatches.length ? (
+                    sortedMatches.map((match) => {
                       const winnerSide = match.winner_side;
                     const tournamentScore = safeFloat(match.tournament_score);
                     const tournamentTier = resolveTournamentTier(
@@ -1252,6 +1683,24 @@ export default function HeadToHead({
                     );
                     const teamAScore = safeFloat(match.team_a_score);
                     const teamBScore = safeFloat(match.team_b_score);
+                    const matchMode = SHOW_MAP_RULESET_COLUMN
+                      ? formatRoundMapMode(
+                        match.round_map_name,
+                        match.round_map_mode,
+                        match.tournament_mode,
+                        match.map_picking_style,
+                        match.tournament_tags,
+                        safeIntOrNull(match.map_index),
+                        safeIntOrNull(match.round_maps_count),
+                      )
+                      : null;
+                    const roundNo = safeIntOrNull(match.round_no);
+                    const mapIndex = safeIntOrNull(match.map_index);
+                    const roundLabel = roundNo === null
+                      ? (mapIndex === null ? '—' : `#${mapIndex}`)
+                      : mapIndex === null
+                        ? `#${roundNo}`
+                        : `#${roundNo}.${mapIndex}`;
                     const winnerLabel = winnerSide === 'team_a'
                       ? 'Team A'
                       : winnerSide === 'team_b'
@@ -1272,12 +1721,18 @@ export default function HeadToHead({
                       : winnerSide === 'team_b'
                         ? `${teamBDisplayName} (${teamBSummary.label})`
                         : 'Winner unavailable';
+                    const rowKey = `${match.match_id}-${match.row_id || match.round_no || '0'}${mapIndex !== null ? `.${mapIndex}` : ''}-${roundNo === null ? 'r' : roundNo}`;
                     return (
-                      <tr key={`${match.match_id}-${match.tournament_id || 0}`}>
+                      <tr
+                        key={rowKey}
+                        className={match.is_synthetic_round ? 'h2h-match-row h2h-match-row--synthetic' : 'h2h-match-row'}
+                      >
                         <td>{match.match_id !== null && match.match_id !== undefined ? String(match.match_id) : '—'}</td>
+                        <td>{roundLabel}</td>
                         <td>
                           {match.tournament_name || (match.tournament_id !== null ? `Tournament ${safeInt(match.tournament_id)}` : '—')}
                         </td>
+                        {SHOW_MAP_RULESET_COLUMN ? <td>{matchMode}</td> : null}
                         <td>
                           <span
                             className={`h2h-tier-pill h2h-tier-pill--${tournamentTier.id}`}
@@ -1292,7 +1747,9 @@ export default function HeadToHead({
                               {winnerLabel}
                             </span>
                             <span className="head-to-head-winner-name" title={winnerMeta}>
-                              {winnerTeamLabel}
+                              {winnerSide === 'team_a' ? `${winnerTeamLabel} won` : winnerSide === 'team_b' ? `${winnerTeamLabel} won` : winnerTeamLabel}
+                              {' '}
+                              ({formatScorePair(teamAScore, teamBScore)})
                             </span>
                           </span>
                         </td>
@@ -1307,8 +1764,8 @@ export default function HeadToHead({
                     );
                   })
                 ) : (
-                  <tr>
-                    <td colSpan={7}>No matchup rows found for current Team A and Team B.</td>
+                    <tr>
+                    <td colSpan={matchTableColSpan}>No matchup rows found for current Team A and Team B.</td>
                   </tr>
                 )}
               </tbody>

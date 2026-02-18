@@ -725,11 +725,59 @@ body::before {
   color: var(--color-text-primary);
 }
 
+.h2h-match-sort {
+  margin: 0.18rem 0 0.4rem;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  width: 280px;
+  margin-left: auto;
+  gap: 0.12rem;
+}
+
+.h2h-match-table {
+  min-width: 1020px;
+}
+
+.h2h-match-table th,
+.h2h-match-table td {
+  padding: 0.58rem 0.66rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  vertical-align: top;
+}
+
+.h2h-match-table .h2h-match-row--synthetic td {
+  opacity: 0.9;
+  font-style: italic;
+}
+
+.h2h-match-table .h2h-match-row .head-to-head-winner-wrap {
+  gap: 0.1rem;
+}
+
+.h2h-match-table th {
+  border-bottom-width: 2px;
+}
+
+.h2h-match-table .head-to-head-winner-wrap {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  align-items: flex-start;
+}
+
+.h2h-match-table .head-to-head-winner-name {
+  color: var(--color-text-secondary);
+  font-size: 0.67rem;
+  max-width: none;
+}
+
 .head-to-head-table .h2h-roster-wrap {
   display: flex;
   flex-direction: column;
   gap: 0.28rem;
-  min-width: 16rem;
+  min-width: 18rem;
 }
 
 .h2h-tier-breakdown {
