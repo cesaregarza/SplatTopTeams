@@ -149,6 +149,8 @@ class TeamSearchStore:
         self.schema = validate_identifier(schema)
         self._vector_capability: Optional[Dict[str, Any]] = None
         self._match_columns: Optional[set[str]] = None
+        self._table_exists_cache: Dict[str, bool] = {}
+        self._table_columns_cache: Dict[str, set[str]] = {}
         self._match_score_columns_cache: Optional[tuple[str, str] | None] = None
         self._player_rankings_rank_column: Optional[str] = None
         self._player_rankings_rank_column_checked: bool = False
@@ -208,6 +210,73 @@ class TeamSearchStore:
             except SQLAlchemyError:
                 self._match_columns = set()
         return self._match_columns
+
+    def _table_exists(self, table_name: str) -> bool:
+        table = table_name.lower()
+        if table in self._table_exists_cache:
+            return self._table_exists_cache[table]
+
+        try:
+            with self.engine.connect() as conn:
+                exists = bool(
+                    conn.execute(
+                        text(
+                            """
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM information_schema.tables
+                                WHERE table_schema = :schema
+                                  AND table_name = :table_name
+                            )
+                            """
+                        ),
+                        {"schema": self.schema, "table_name": table},
+                    ).scalar_one()
+                )
+        except SQLAlchemyError:
+            exists = False
+        self._table_exists_cache[table] = exists
+        return exists
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        table = table_name.lower()
+        if table in self._table_columns_cache:
+            return self._table_columns_cache[table]
+
+        if not self._table_exists(table):
+            self._table_columns_cache[table] = set()
+            return self._table_columns_cache[table]
+
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = :schema
+                          AND table_name = :table_name
+                        """
+                    ),
+                    {"schema": self.schema, "table_name": table},
+                ).scalars().all()
+            columns = {str(row).lower() for row in rows}
+        except SQLAlchemyError:
+            columns = set()
+        self._table_columns_cache[table] = columns
+        return columns
+
+    @staticmethod
+    def _pick_first(columns: set[str], *candidates: str) -> str | None:
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    @staticmethod
+    def _quote(identifier: str) -> str:
+        escaped = identifier.replace('"', '""')
+        return f'"{escaped}"'
 
     def _resolve_match_score_columns(self) -> Optional[tuple[str, str]]:
         if self._match_score_columns_cache is None:
@@ -334,6 +403,505 @@ class TeamSearchStore:
                 ]
 
         return rosters
+
+    def _fetch_match_rounds(
+        self,
+        rows: Sequence[dict],
+        team_a_ids: Sequence[int],
+        team_b_ids: Sequence[int],
+    ) -> Dict[tuple[int, int], List[Dict[str, object]]]:
+        if not rows:
+            return {}
+
+        def to_int(value: Any) -> Optional[int]:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def to_float(value: Any) -> Optional[float]:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if np.isfinite(parsed) else None
+
+        def to_text(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            normalized = str(value).strip()
+            return normalized or None
+
+        def winner_side_from_row(
+            winner_team_id: Optional[int],
+            winner_side: Optional[str],
+            team_a_id: Optional[int],
+            team_b_id: Optional[int],
+        ) -> Optional[str]:
+            if winner_team_id is not None:
+                if team_a_id is not None and winner_team_id == team_a_id:
+                    return "team_a"
+                if team_b_id is not None and winner_team_id == team_b_id:
+                    return "team_b"
+            if isinstance(winner_side, str):
+                normalized = winner_side.strip().lower()
+                if normalized in ("team_a", "a", "1", "left", "left_team", "team1"):
+                    return "team_a"
+                if normalized in ("team_b", "b", "2", "right", "right_team", "team2"):
+                    return "team_b"
+            return None
+
+        match_context: dict[int, dict[str, object]] = {}
+        team_a_set = set(int(team_id) for team_id in team_a_ids)
+        team_b_set = set(int(team_id) for team_id in team_b_ids)
+
+        for row in rows:
+            match_id = to_int(row.get("match_id"))
+            if match_id is None or match_id <= 0:
+                continue
+
+            team1_id = to_int(row.get("team1_id"))
+            team2_id = to_int(row.get("team2_id"))
+            if team1_id is not None and team2_id is not None:
+                if team1_id in team_a_set:
+                    team_a_id = team1_id
+                    team_b_id = team2_id if team2_id in team_b_set else None
+                    team1_is_team_a = True
+                elif team2_id in team_a_set:
+                    team_a_id = team2_id
+                    team_b_id = team1_id if team1_id in team_b_set else None
+                    team1_is_team_a = False
+                else:
+                    team_a_id = None
+                    team_b_id = None
+                    team1_is_team_a = False
+            else:
+                team_a_id = None
+                team_b_id = None
+                team1_is_team_a = False
+
+            tournament_id = to_int(row.get("tournament_id")) or 0
+
+            match_context[match_id] = {
+                "team1_id": team1_id,
+                "team2_id": team2_id,
+                "team_a_id": team_a_id,
+                "team_b_id": team_b_id,
+                "team1_is_team_a": bool(team1_is_team_a),
+                "team1_score": to_float(row.get("team1_score")),
+                "team2_score": to_float(row.get("team2_score")),
+                "winner_team_id": to_int(row.get("winner_team_id")),
+                "tournament_id": tournament_id,
+            }
+
+        if not match_context:
+            return {}
+
+        unique_match_ids = sorted(match_context.keys())
+
+        # In some ranking schemas, match-level rows do not have per-map child tables.
+        # A `rounds` table exists that carries per-round metadata including
+        # map count/type, which is enough to expand matches into per-map rows.
+        rounds_columns = self._table_columns("rounds")
+        if (
+            self._table_exists("rounds")
+            and "round_id" in rounds_columns
+            and "number" in rounds_columns
+            and ("maps_count" in rounds_columns or "maps_type" in rounds_columns)
+        ):
+            round_sql = f"""
+                SELECT
+                    m.{self._quote('match_id')} AS match_id,
+                    m.{self._quote('tournament_id')} AS tournament_id,
+                    m.{self._quote('team1_id')} AS team1_id,
+                    m.{self._quote('team2_id')} AS team2_id,
+                    m.{self._quote('team1_score')} AS team1_score,
+                    m.{self._quote('team2_score')} AS team2_score,
+                    m.{self._quote('winner_team_id')} AS winner_team_id_raw,
+                    r.{self._quote('round_id')} AS round_id,
+                    r.{self._quote('number')} AS round_no,
+                    r.{self._quote('maps_count')} AS maps_count,
+                    r.{self._quote('maps_type')} AS map_mode
+                FROM {self.schema}.{self._quote('matches')} m
+                LEFT JOIN {self.schema}.{self._quote('rounds')} r
+                  ON m.{self._quote('round_id')} = r.{self._quote('round_id')}
+                WHERE m.{self._quote('match_id')} IN :match_ids
+                ORDER BY r.{self._quote('number')} NULLS LAST
+            """
+
+            query_rows: list[dict[str, object]] = []
+            try:
+                with self.engine.connect() as conn:
+                    query_rows = [
+                        dict(row)
+                        for row in conn.execute(
+                            text(round_sql).bindparams(bindparam("match_ids", expanding=True)),
+                            {"match_ids": unique_match_ids},
+                        ).mappings().all()
+                    ]
+            except SQLAlchemyError as exc:
+                if not (
+                    _is_missing_relation_error(exc)
+                    or _is_missing_column_error(exc)
+                    or _is_access_error(exc)
+                ):
+                    raise
+                query_rows = []
+
+            if query_rows:
+                out = {}
+                for row in query_rows:
+                    match_id = to_int(row.get("match_id"))
+                    if match_id is None or match_id <= 0:
+                        continue
+
+                    context = match_context.get(match_id)
+                    if context is None:
+                        continue
+
+                    tournament_id = (
+                        to_int(row.get("tournament_id"))
+                        or to_int(context.get("tournament_id"))
+                        or 0
+                    )
+                    team_a_id = to_int(context.get("team_a_id"))
+                    team_b_id = to_int(context.get("team_b_id"))
+                    team1_is_team_a = bool(context.get("team1_is_team_a"))
+                    team1_score = to_float(row.get("team1_score"))
+                    team2_score = to_float(row.get("team2_score"))
+                    winner_team_id = to_int(row.get("winner_team_id_raw"))
+
+                    if team1_is_team_a:
+                        team_a_score = team1_score
+                        team_b_score = team2_score
+                    else:
+                        team_a_score = team2_score
+                        team_b_score = team1_score
+
+                    winner_side = winner_side_from_row(
+                        winner_team_id,
+                        None,
+                        team_a_id,
+                        team_b_id,
+                    )
+                    if winner_side is None and team_a_score is not None and team_b_score is not None:
+                        if team_a_score != team_b_score:
+                            winner_side = "team_a" if team_a_score > team_b_score else "team_b"
+
+                    maps_count = to_int(row.get("maps_count")) or 1
+                    if maps_count <= 0:
+                        maps_count = 1
+                    if maps_count > 20:
+                        maps_count = 20
+
+                    raw_round_no = to_int(row.get("round_no"))
+                    round_id = to_int(row.get("round_id"))
+
+                    for map_index in range(1, maps_count + 1):
+                        map_round_no = map_index
+                        if raw_round_no is not None:
+                            map_round_no = raw_round_no
+                        map_name = None
+                        normalized_round = {
+                            "round_id": round_id,
+                            "round_no": map_round_no,
+                            "maps_count": maps_count,
+                            "map_name": map_name,
+                            "map_index": map_index,
+                            "map_mode": to_text(row.get("map_mode")),
+                            "team_a_score": team_a_score,
+                            "team_b_score": team_b_score,
+                            "winner_team_id": winner_team_id,
+                            "winner_side": winner_side,
+                        }
+                        key = (match_id, tournament_id)
+                        out.setdefault(key, []).append(normalized_round)
+
+                for rounds in out.values():
+                    rounds.sort(
+                        key=lambda round_row: (
+                            round_row.get("round_no") is None,
+                            to_int(round_row.get("round_no")) if round_row.get("round_no") is not None else 1_000_000,
+                            to_int(round_row.get("map_index"))
+                            if round_row.get("map_index") is not None
+                            else 1_000_000,
+                        )
+                    )
+
+                return out
+
+                # Fallback to the generic table resolution below.
+
+        candidate_tables = (
+            "match_rounds",
+            "match_round",
+            "match_maps",
+            "match_round_map",
+            "match_games",
+            "match_map",
+            "match_game",
+        )
+
+        best_candidate: Optional[tuple[int, str, dict[str, Optional[str]]]] = None
+
+        score_pairs = (
+            ("team1_score", "team2_score"),
+            ("team_1_score", "team_2_score"),
+            ("score1", "score2"),
+            ("score_1", "score_2"),
+            ("team1_points", "team2_points"),
+            ("team1_goals", "team2_goals"),
+            ("team_a_score", "team_b_score"),
+            ("a_score", "b_score"),
+            ("left_score", "right_score"),
+        )
+        round_no_candidates = (
+            "round_no",
+            "round_number",
+            "round",
+            "map_no",
+            "map_number",
+            "number",
+            "index",
+        )
+        map_name_candidates = (
+            "map_name",
+            "map",
+            "stage_name",
+            "name",
+            "source",
+            "map_label",
+        )
+        maps_count_candidates = (
+            "maps_count",
+            "maps",
+            "map_count",
+            "match_maps_count",
+            "match_map_count",
+            "game_count",
+        )
+        map_mode_candidates = (
+            "map_mode",
+            "mode",
+            "game_mode",
+            "map_mode_hint",
+            "type",
+        )
+        winner_team_candidates = (
+            "winner_team_id",
+            "winner_id",
+            "winner_side_id",
+            "winning_team_id",
+            "winner",
+        )
+        winner_side_candidates = ("winner_side", "winner", "result", "victor")
+
+        for table_name in candidate_tables:
+            if not self._table_exists(table_name):
+                continue
+
+            columns = self._table_columns(table_name)
+            if "match_id" not in columns:
+                continue
+
+            round_no_col = self._pick_first(columns, *round_no_candidates)
+            map_name_col = self._pick_first(columns, *map_name_candidates)
+            maps_count_col = self._pick_first(columns, *maps_count_candidates)
+            map_mode_col = self._pick_first(columns, *map_mode_candidates)
+            winner_team_col = self._pick_first(columns, *winner_team_candidates)
+            winner_side_col = self._pick_first(columns, *winner_side_candidates)
+            score_a_col, score_b_col = None, None
+            for left_score_col, right_score_col in score_pairs:
+                if left_score_col in columns and right_score_col in columns:
+                    score_a_col = left_score_col
+                    score_b_col = right_score_col
+                    break
+
+            useful_bits = 0
+            if round_no_col:
+                useful_bits += 2
+            if map_name_col or map_mode_col:
+                useful_bits += 1
+            if score_a_col and score_b_col:
+                useful_bits += 2
+            if winner_team_col or winner_side_col:
+                useful_bits += 1
+
+            if useful_bits == 0:
+                continue
+
+            candidate = {
+                "table": table_name,
+                "columns": columns,
+                "round_no_col": round_no_col,
+                "map_name_col": map_name_col,
+                "maps_count_col": maps_count_col,
+                "map_mode_col": map_mode_col,
+                "score_a_col": score_a_col,
+                "score_b_col": score_b_col,
+                "winner_team_col": winner_team_col,
+                "winner_side_col": winner_side_col,
+            }
+
+            if best_candidate is None or useful_bits > best_candidate[0]:
+                best_candidate = (useful_bits, table_name, candidate)
+
+        if best_candidate is None:
+            return {}
+
+        _, selected_table, candidate_info = best_candidate
+        row_columns = []
+        row_columns.append(f"m.{self._quote('match_id')} AS match_id")
+        if "tournament_id" in (candidate_info["columns"] or {}):
+            row_columns.append(f"m.{self._quote('tournament_id')} AS tournament_id")
+        else:
+            row_columns.append("NULL::bigint AS tournament_id")
+
+        if candidate_info["round_no_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['round_no_col'])} AS round_no"
+            )
+        if candidate_info["map_name_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['map_name_col'])} AS map_name"
+            )
+        if candidate_info["maps_count_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['maps_count_col'])} AS maps_count"
+            )
+        if candidate_info["map_mode_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['map_mode_col'])} AS map_mode"
+            )
+
+        if candidate_info["score_a_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['score_a_col'])} AS team_a_round_score_raw"
+            )
+            row_columns.append(
+                f"m.{self._quote(candidate_info['score_b_col'])} AS team_b_round_score_raw"
+            )
+
+        if candidate_info["winner_team_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['winner_team_col'])} AS winner_team_id_raw"
+            )
+        elif candidate_info["winner_side_col"]:
+            row_columns.append(
+                f"m.{self._quote(candidate_info['winner_side_col'])} AS winner_side_raw"
+            )
+
+        if candidate_info["columns"] and self._pick_first(candidate_info["columns"], "round_id"):
+            row_columns.append(f"m.{self._quote('round_id')} AS round_id")
+
+        order_by_expr = "NULL"
+        if candidate_info["round_no_col"]:
+            order_by_expr = f"m.{self._quote(candidate_info['round_no_col'])} NULLS LAST"
+
+        sql = f"""
+            SELECT
+                {', '.join(row_columns)}
+            FROM {self.schema}.{self._quote(selected_table)} m
+            WHERE m.match_id IN :match_ids
+            ORDER BY {order_by_expr}
+        """
+
+        query_rows: list[dict[str, object]]
+        try:
+            with self.engine.connect() as conn:
+                query_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        text(sql).bindparams(bindparam("match_ids", expanding=True)),
+                        {"match_ids": unique_match_ids},
+                    ).mappings().all()
+                ]
+        except SQLAlchemyError as exc:
+            if not (
+                _is_missing_relation_error(exc)
+                or _is_missing_column_error(exc)
+                or _is_access_error(exc)
+            ):
+                raise
+            return {}
+
+        if not query_rows:
+            return {}
+
+        out: Dict[tuple[int, int], List[Dict[str, object]]] = {}
+        row_index_by_match: dict[tuple[int, int], int] = {}
+
+        for row in query_rows:
+            match_id = to_int(row.get("match_id"))
+            if match_id is None or match_id <= 0:
+                continue
+
+            context = match_context.get(match_id)
+            if context is None:
+                continue
+
+            tournament_id = to_int(row.get("tournament_id")) or to_int(context.get("tournament_id")) or 0
+
+            team_a_id = context.get("team_a_id")
+            team_a_id = to_int(team_a_id)
+            team_b_id = to_int(context.get("team_b_id"))
+
+            team1_is_team_a = bool(context.get("team1_is_team_a"))
+            team1_score = to_float(row.get("team_a_round_score_raw"))
+            team2_score = to_float(row.get("team_b_round_score_raw"))
+
+            if team1_is_team_a:
+                team_a_score = team1_score
+                team_b_score = team2_score
+            else:
+                team_a_score = team2_score
+                team_b_score = team1_score
+
+            winner_team_id = to_int(row.get("winner_team_id_raw"))
+            winner_side = winner_side_from_row(
+                winner_team_id,
+                row.get("winner_side_raw") if winner_team_id is None else None,
+                team_a_id,
+                team_b_id,
+            )
+
+            if winner_side is None and team_a_score is not None and team_b_score is not None:
+                if team_a_score != team_b_score:
+                    winner_side = "team_a" if team_a_score > team_b_score else "team_b"
+
+            round_no = to_int(row.get("round_no"))
+            key = (match_id, tournament_id)
+            map_index = round_no
+            if map_index is None:
+                map_index = row_index_by_match.get(key, 0) + 1
+            row_index_by_match[key] = map_index
+
+            normalized_round = {
+                "round_id": to_int(row.get("round_id")),
+                "round_no": round_no,
+                "maps_count": to_int(row.get("maps_count")),
+                "map_name": to_text(row.get("map_name")),
+                "map_mode": to_text(row.get("map_mode")),
+                "map_index": map_index,
+                "team_a_score": team_a_score,
+                "team_b_score": team_b_score,
+                "winner_team_id": winner_team_id,
+                "winner_side": winner_side,
+            }
+
+            key = (match_id, tournament_id)
+            out.setdefault(key, []).append(normalized_round)
+
+        for rounds in out.values():
+            rounds.sort(
+                key=lambda round_row: (
+                    round_row.get("round_no") is None,
+                    to_int(round_row.get("round_no")) if round_row.get("round_no") is not None else 1_000_000,
+                    to_int(round_row.get("map_index")) if round_row.get("map_index") is not None else 1_000_000,
+                )
+            )
+
+        return out
 
     def _fetch_tournament_scores(
         self, tournament_ids: Sequence[int]
@@ -1873,6 +2441,9 @@ class TeamSearchStore:
                     m.team2_id,
                     {winner_score_select}
                     ,
+                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                    t.tags AS tournament_tags,
                     CASE
                         WHEN m.last_game_finished_at_ms IS NOT NULL THEN m.last_game_finished_at_ms
                         WHEN m.created_at_ms IS NOT NULL THEN m.created_at_ms
@@ -1904,6 +2475,9 @@ class TeamSearchStore:
                     m.team2_id,
                     {winner_score_select}
                     ,
+                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                    t.tags AS tournament_tags,
                     CASE
                         WHEN m.last_game_finished_at_ms IS NOT NULL THEN m.last_game_finished_at_ms
                         WHEN m.created_at_ms IS NOT NULL THEN m.created_at_ms
@@ -1935,6 +2509,9 @@ class TeamSearchStore:
                     m.team2_id,
                     {winner_score_select}
                     ,
+                    NULL::text AS tournament_mode,
+                    NULL::text AS map_picking_style,
+                    NULL::jsonb AS tournament_tags,
                     CASE
                         WHEN m.last_game_finished_at_ms IS NOT NULL THEN m.last_game_finished_at_ms
                         WHEN m.created_at_ms IS NOT NULL THEN m.created_at_ms
@@ -1995,7 +2572,12 @@ class TeamSearchStore:
                     len(team_b_ids_sorted),
                 )
 
-        match_rosters = self._fetch_match_rosters(rows, team_a_ids_sorted, team_b_ids_sorted)
+        match_rosters = self._fetch_match_rosters(
+            rows, team_a_ids_sorted, team_b_ids_sorted
+        )
+        match_rounds = self._fetch_match_rounds(
+            rows, team_a_ids_sorted, team_b_ids_sorted
+        )
         tournament_scores = self._fetch_tournament_scores(
             [
                 int(row["tournament_id"])
@@ -2084,13 +2666,11 @@ class TeamSearchStore:
             team_a_roster_names = list(roster.get("team_a", {}).get("player_names", []))
             team_b_roster_ids = list(roster.get("team_b", {}).get("player_ids", []))
             team_b_roster_names = list(roster.get("team_b", {}).get("player_names", []))
-
+            match_round_rows = match_rounds.get(roster_key, [])
             side = None
             if winner_team_id in team_a_set:
-                summary["team_a_wins"] += 1
                 side = "team_a"
             elif winner_team_id in team_b_set:
-                summary["team_b_wins"] += 1
                 side = "team_b"
             elif (
                 team_a_score is not None
@@ -2098,11 +2678,31 @@ class TeamSearchStore:
                 and team_a_score != team_b_score
             ):
                 if team_a_score > team_b_score:
-                    summary["team_a_wins"] += 1
                     side = "team_a"
                 else:
-                    summary["team_b_wins"] += 1
                     side = "team_b"
+
+            if not match_round_rows and team_a_score is not None:
+                match_round_rows = [
+                    {
+                        "round_no": None,
+                        "maps_count": None,
+                        "map_index": 1,
+                        "map_name": None,
+                        "map_mode": None,
+                        "team_a_score": team_a_score,
+                        "team_b_score": team_b_score,
+                        "winner_team_id": winner_team_id,
+                        "winner_side": side,
+                    }
+                ]
+
+            if side is None:
+                summary["unresolved_matches"] += 1
+            elif side == "team_a":
+                summary["team_a_wins"] += 1
+            elif side == "team_b":
+                summary["team_b_wins"] += 1
             else:
                 summary["unresolved_matches"] += 1
 
@@ -2132,6 +2732,9 @@ class TeamSearchStore:
                     "match_id": int(row["match_id"]),
                     "tournament_id": tournament_id,
                     "tournament_name": row["tournament_name"],
+                    "tournament_mode": row.get("tournament_mode"),
+                    "map_picking_style": row.get("map_picking_style"),
+                    "tournament_tags": row.get("tournament_tags"),
                     "tournament_score": (
                         None if tournament_strength is None else round(float(tournament_strength), 4)
                     ),
@@ -2164,6 +2767,7 @@ class TeamSearchStore:
                     "event_time_ms": (
                         int(row["event_time_ms"]) if row["event_time_ms"] is not None else None
                     ),
+                    "match_rounds": match_round_rows,
                     "team_a_is_winner": bool(side == "team_a"),
                     "team_b_is_winner": bool(side == "team_b"),
                 }
