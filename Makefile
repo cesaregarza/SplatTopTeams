@@ -7,7 +7,7 @@ FRONTEND_DIR := frontend
 DAYS ?= 540
 LOCAL_DB_URL ?= postgresql://postgres:postgres@localhost:5432/rankings_db?sslmode=disable
 DOCKER_LOCAL_DB_URL ?= postgresql://postgres:postgres@postgres:5432/rankings_db?sslmode=disable
-MIRROR_TABLES ?= matches,tournaments,player_appearance_teams,tournament_teams,team_search_refresh_runs,team_search_clusters,team_search_embeddings,players,player_rankings
+MIRROR_TABLES ?= matches,tournaments,player_appearance_teams,player_appearances,player_rankings,players,rounds,stages,groups,tournament_teams,team_search_refresh_runs,team_search_clusters,team_search_embeddings
 MIRROR_CHUNK_SIZE ?= 5000
 MIRROR_ALLOW_MISSING ?= 1
 
@@ -150,7 +150,11 @@ compose-up-local:
 	RANKINGS_DATABASE_URL_DOCKER="$(DOCKER_LOCAL_DB_URL)" docker compose up -d --build
 
 compose-up-remote:
-	RANKINGS_DATABASE_URL_DOCKER="$(RANKINGS_DATABASE_URL)" docker compose up -d --build
+	@set -euo pipefail; \
+	if [ ! -f .env ]; then echo "Missing .env"; exit 1; fi; \
+	set -a; source .env; set +a; \
+	if [ -z "$${RANKINGS_DATABASE_URL:-}" ]; then echo "RANKINGS_DATABASE_URL is required in .env"; exit 1; fi; \
+	RANKINGS_DATABASE_URL_DOCKER="$$RANKINGS_DATABASE_URL" docker compose up -d --build
 
 compose-refresh-local:
 	@set -euo pipefail; \
