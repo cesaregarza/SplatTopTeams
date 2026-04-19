@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from team_api.store import _normalize_query, _tournament_tier
+from team_api.store import (
+    _extract_sendou_teams_from_turbo_payload,
+    _normalize_query,
+    _tournament_tier,
+)
 
 
 def test_normalize_query_strips_non_alphanumerics():
@@ -24,3 +28,31 @@ def test_tournament_tier_uses_rank_cutoffs():
     assert _tournament_tier(80.1)["tier_id"] == "a_minus"
     assert _tournament_tier(160.0)["tier_id"] == "a_minus"
     assert _tournament_tier(None)["tier_id"] == "unscored"
+
+
+def test_extract_sendou_teams_from_turbo_payload_reads_route_data():
+    payload = [
+        {"_1": 2},
+        "features/tournament/routes/to.$id",
+        {"_3": 4},
+        "data",
+        "{\"tournament\":{\"ctx\":{\"teams\":[{\"id\":31921,\"name\":\"Moonlight\"},{\"id\":31922,\"name\":\"FTW\"}]}}}",
+    ]
+
+    teams = _extract_sendou_teams_from_turbo_payload(payload)
+    assert teams == [
+        {
+            "team_id": 31921,
+            "team_name": "Moonlight",
+            "display_name": "Moonlight",
+            "member_user_ids": [],
+            "member_names": [],
+        },
+        {
+            "team_id": 31922,
+            "team_name": "FTW",
+            "display_name": "FTW",
+            "member_user_ids": [],
+            "member_names": [],
+        },
+    ]

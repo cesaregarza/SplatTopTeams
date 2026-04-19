@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import math
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from hashlib import blake2b
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from sqlalchemy import text
 
 from shared_lib.db import create_engine, get_schema, resolve_database_url
+from shared_lib.team_vector_utils import (
+    build_identity_idf_lookup,
+    canonicalize_player_ids,
+    hash_index,
+    hash_sign,
+    lineup_key,
+    pair_key,
+    unordered_player_pairs,
+)
 from team_api.sql import get_vector_column_info, ensure_search_tables, validate_identifier
 
 logger = logging.getLogger(__name__)
@@ -41,6 +50,12 @@ class TeamPayload:
     top_lineup_summary: str
     top_lineup_player_ids: Tuple[int, ...]
     top_lineup_player_names: Tuple[str, ...]
+    roster_player_ids: Tuple[int, ...]
+    roster_player_names: Tuple[str, ...]
+    roster_player_match_counts: Tuple[int, ...]
+    player_support: Dict[str, float]
+    pair_support: Dict[str, float]
+    lineup_variant_counts: Dict[str, int]
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -71,21 +86,6 @@ def _to_db_seconds(v: Optional[int]) -> Optional[int]:
         return None
     iv = int(v)
     return iv // 1000 if iv > 1_000_000_000_000 else iv
-
-
-def _hash_value(player_id: int, salt: str) -> int:
-    digest = blake2b(
-        f"{player_id}|{salt}".encode("utf-8"), digest_size=8
-    ).digest()
-    return int.from_bytes(digest, "little", signed=False)
-
-
-def _hash_index(player_id: int, dim: int, salt: str) -> int:
-    return int(_hash_value(player_id, salt) % dim)
-
-
-def _hash_sign(player_id: int, salt: str) -> float:
-    return 1.0 if (_hash_value(player_id, salt) & 1) == 0 else -1.0
 
 
 def _fetch_lineups(
@@ -272,8 +272,8 @@ def _build_semantic_vectors(
         for lineup in lineups:
             vec = np.zeros(dim, dtype=np.float64)
             for player_id in lineup:
-                idx = _hash_index(player_id, dim, "sem_idx")
-                sign = _hash_sign(player_id, "sem_sign")
+                idx = hash_index(player_id, dim, "sem_idx")
+                sign = hash_sign(player_id, "sem_sign")
                 vec[idx] += sign
             lineup_vecs.append(_normalize(vec))
 
@@ -288,30 +288,65 @@ def _build_identity_vectors(
     dim: int,
     idf_cap: float,
 ) -> Dict[int, np.ndarray]:
-    n_teams = max(1, len(team_player_counts))
-
-    player_team_count: Dict[int, int] = defaultdict(int)
-    for team_counts in team_player_counts.values():
-        for player_id in team_counts.keys():
-            player_team_count[player_id] += 1
-
-    idf: Dict[int, float] = {}
-    for player_id, team_count in player_team_count.items():
-        val = math.log((n_teams + 1) / (team_count + 1))
-        if idf_cap > 0:
-            val = min(val, idf_cap)
-        idf[player_id] = val
+    idf = build_identity_idf_lookup(
+        (team_counts.keys() for team_counts in team_player_counts.values()),
+        idf_cap=idf_cap,
+    )
 
     out: Dict[int, np.ndarray] = {}
     for team_id, counts in team_player_counts.items():
         vec = np.zeros(dim, dtype=np.float64)
         for player_id, count in counts.items():
-            idx = _hash_index(player_id, dim, "id_idx")
-            sign = _hash_sign(player_id, "id_sign")
+            idx = hash_index(player_id, dim, "id_idx")
+            sign = hash_sign(player_id, "id_sign")
             vec[idx] += sign * float(count) * idf.get(player_id, 1.0)
         out[team_id] = _normalize(vec)
 
     return out
+
+
+def _build_support_maps(
+    lineups: Sequence[Tuple[int, ...]],
+) -> tuple[Dict[str, float], Dict[str, float]]:
+    if not lineups:
+        return {}, {}
+
+    total_lineups = max(1, len(lineups))
+    player_counts: Counter[int] = Counter()
+    pair_counts: Counter[str] = Counter()
+
+    for lineup in lineups:
+        player_ids = canonicalize_player_ids(lineup)
+        if not player_ids:
+            continue
+        for player_id in player_ids:
+            player_counts[int(player_id)] += 1
+        for left, right in unordered_player_pairs(player_ids):
+            pair_counts[pair_key(left, right)] += 1
+
+    player_support = {
+        str(player_id): float(count) / float(total_lineups)
+        for player_id, count in sorted(player_counts.items())
+        if int(player_id) > 0 and int(count) > 0
+    }
+    pair_support = {
+        key: float(count) / float(total_lineups)
+        for key, count in sorted(pair_counts.items())
+        if key and int(count) > 0
+    }
+    return player_support, pair_support
+
+
+def _build_lineup_variant_counts(
+    lineup_counter: Counter[Tuple[int, ...]],
+) -> Dict[str, int]:
+    if not lineup_counter:
+        return {}
+    return {
+        lineup_key(lineup): int(count)
+        for lineup, count in sorted(lineup_counter.items())
+        if lineup and int(count) > 0
+    }
 
 
 def _top_lineup(lineup_counts: Counter[Tuple[int, ...]]) -> tuple[int, Tuple[int, ...]]:
@@ -379,7 +414,26 @@ def _build_payloads(
             player_name_by_id.get(player_id, "Unknown Player")
             for player_id in top_lineup
         )
-        unique_player_count = len(team_player_counts.get(team_id, {}))
+        roster_counts = team_player_counts.get(team_id, {})
+        unique_player_count = len(roster_counts)
+        roster_sorted = sorted(
+            (
+                (int(player_id), int(count))
+                for player_id, count in roster_counts.items()
+                if player_id is not None
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        roster_player_ids = tuple(player_id for player_id, _ in roster_sorted)
+        roster_player_match_counts = tuple(count for _, count in roster_sorted)
+        roster_player_names = tuple(
+            player_name_by_id.get(player_id, "Unknown Player")
+            for player_id in roster_player_ids
+        )
+        player_support, pair_support = _build_support_maps(
+            team_lineups.get(team_id, [])
+        )
+        lineup_variant_counts = _build_lineup_variant_counts(lineup_counter)
         payloads.append(
             TeamPayload(
                 team_id=team_id,
@@ -399,6 +453,12 @@ def _build_payloads(
                 top_lineup_summary=_top_lineup_summary(top_count, top_lineup_names),
                 top_lineup_player_ids=top_lineup,
                 top_lineup_player_names=top_lineup_names,
+                roster_player_ids=roster_player_ids,
+                roster_player_names=roster_player_names,
+                roster_player_match_counts=roster_player_match_counts,
+                player_support=player_support,
+                pair_support=pair_support,
+                lineup_variant_counts=lineup_variant_counts,
             )
         )
     return payloads
@@ -454,6 +514,7 @@ def _start_run(
     semantic_dim: int,
     identity_dim: int,
     identity_beta: float,
+    identity_idf_cap: float,
     since_ms: Optional[int],
     until_ms: Optional[int],
 ) -> int:
@@ -465,6 +526,7 @@ def _start_run(
             semantic_dim,
             identity_dim,
             identity_beta,
+            identity_idf_cap,
             source_since_ms,
             source_until_ms
         ) VALUES (
@@ -473,6 +535,7 @@ def _start_run(
             :semantic_dim,
             :identity_dim,
             :identity_beta,
+            :identity_idf_cap,
             :source_since_ms,
             :source_until_ms
         )
@@ -486,6 +549,7 @@ def _start_run(
                 "semantic_dim": int(semantic_dim),
                 "identity_dim": int(identity_dim),
                 "identity_beta": float(identity_beta),
+                "identity_idf_cap": float(identity_idf_cap),
                 "source_since_ms": since_ms,
                 "source_until_ms": until_ms,
             },
@@ -568,6 +632,12 @@ def _persist_snapshot(
             top_lineup_summary,
             top_lineup_player_ids,
             top_lineup_player_names,
+            roster_player_ids,
+            roster_player_names,
+            roster_player_match_counts,
+            player_support,
+            pair_support,
+            lineup_variant_counts,
             semantic_dim,
             identity_dim,
             identity_beta
@@ -590,6 +660,12 @@ def _persist_snapshot(
             :top_lineup_summary,
             :top_lineup_player_ids,
             :top_lineup_player_names,
+            :roster_player_ids,
+            :roster_player_names,
+            :roster_player_match_counts,
+            CAST(:player_support AS JSONB),
+            CAST(:pair_support AS JSONB),
+            CAST(:lineup_variant_counts AS JSONB),
             :semantic_dim,
             :identity_dim,
             :identity_beta
@@ -616,6 +692,12 @@ def _persist_snapshot(
             top_lineup_summary,
             top_lineup_player_ids,
             top_lineup_player_names,
+            roster_player_ids,
+            roster_player_names,
+            roster_player_match_counts,
+            player_support,
+            pair_support,
+            lineup_variant_counts,
             semantic_dim,
             identity_dim,
             identity_beta,
@@ -639,6 +721,12 @@ def _persist_snapshot(
             :top_lineup_summary,
             :top_lineup_player_ids,
             :top_lineup_player_names,
+            :roster_player_ids,
+            :roster_player_names,
+            :roster_player_match_counts,
+            CAST(:player_support AS JSONB),
+            CAST(:pair_support AS JSONB),
+            CAST(:lineup_variant_counts AS JSONB),
             :semantic_dim,
             :identity_dim,
             :identity_beta,
@@ -668,6 +756,17 @@ def _persist_snapshot(
                 "top_lineup_summary": payload.top_lineup_summary,
                 "top_lineup_player_ids": list(payload.top_lineup_player_ids),
                 "top_lineup_player_names": list(payload.top_lineup_player_names),
+                "roster_player_ids": list(payload.roster_player_ids),
+                "roster_player_names": list(payload.roster_player_names),
+                "roster_player_match_counts": [
+                    int(value) for value in payload.roster_player_match_counts
+                ],
+                "player_support": json.dumps(payload.player_support, sort_keys=True),
+                "pair_support": json.dumps(payload.pair_support, sort_keys=True),
+                "lineup_variant_counts": json.dumps(
+                    payload.lineup_variant_counts,
+                    sort_keys=True,
+                ),
                 "semantic_dim": int(payload.semantic_vector.shape[0]),
                 "identity_dim": int(payload.identity_vector.shape[0]),
                 "identity_beta": float(identity_beta),
@@ -802,6 +901,7 @@ def run_refresh(
         semantic_dim=semantic_dim,
         identity_dim=identity_dim,
         identity_beta=identity_beta,
+        identity_idf_cap=identity_idf_cap,
         since_ms=since_ms,
         until_ms=until_ms,
     )

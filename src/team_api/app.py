@@ -9,6 +9,7 @@ from team_api.middleware import RateLimitMiddleware
 from team_api.routes.analytics import router as analytics_router
 from team_api.routes.clusters import router as clusters_router
 from team_api.routes.health import router as health_router
+from team_api.routes.players import router as players_router
 from team_api.routes.team_search import router as team_search_router
 from team_api.settings import get_settings
 
@@ -52,6 +53,7 @@ app.include_router(health_router)
 app.include_router(team_search_router)
 app.include_router(clusters_router)
 app.include_router(analytics_router)
+app.include_router(players_router)
 
 
 @app.get("/")

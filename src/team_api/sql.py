@@ -76,6 +76,16 @@ def _has_vector_columns(conn, schema: str) -> dict:
     }
 
 
+def _execute_ddl_in_savepoint(conn, statement: str) -> bool:
+    """Run optional DDL without aborting the outer transaction on failure."""
+    try:
+        with conn.begin_nested():
+            conn.execute(text(statement))
+    except SQLAlchemyError:
+        return False
+    return True
+
+
 def ensure_search_tables(
     engine: Engine,
     schema: str,
@@ -95,6 +105,7 @@ def ensure_search_tables(
             semantic_dim INTEGER NOT NULL,
             identity_dim INTEGER NOT NULL,
             identity_beta DOUBLE PRECISION NOT NULL,
+            identity_idf_cap DOUBLE PRECISION NOT NULL DEFAULT 3.0,
             source_since_ms BIGINT NULL,
             source_until_ms BIGINT NULL,
             teams_indexed INTEGER NULL,
@@ -123,6 +134,9 @@ def ensure_search_tables(
             top_lineup_summary TEXT NULL,
             top_lineup_player_ids BIGINT[] NULL,
             top_lineup_player_names TEXT[] NULL,
+            player_support JSONB NULL,
+            pair_support JSONB NULL,
+            lineup_variant_counts JSONB NULL,
             semantic_dim INTEGER NOT NULL,
             identity_dim INTEGER NOT NULL,
             identity_beta DOUBLE PRECISION NOT NULL,
@@ -216,16 +230,64 @@ def ensure_search_tables(
                 "ADD COLUMN IF NOT EXISTS top_lineup_player_names TEXT[]"
             )
         )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS roster_player_ids BIGINT[]"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS roster_player_names TEXT[]"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS roster_player_match_counts INTEGER[]"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS player_support JSONB"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS pair_support JSONB"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_embeddings "
+                "ADD COLUMN IF NOT EXISTS lineup_variant_counts JSONB"
+            )
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE {schema}.team_search_refresh_runs "
+                "ADD COLUMN IF NOT EXISTS identity_idf_cap DOUBLE PRECISION NOT NULL DEFAULT 3.0"
+            )
+        )
+        conn.execute(
+            text(
+                f"""
+                CREATE INDEX IF NOT EXISTS ix_team_search_embeddings_roster_player_ids_gin
+                    ON {schema}.team_search_embeddings USING GIN (roster_player_ids)
+                """
+            )
+        )
 
         vector_dim = final_vector_dim
         if vector_dim is None:
             vector_dim = _has_vector_columns(conn, schema).get("final_vector_vec_dim")
         if vector_dim:
-            try:
-                conn.execute(
-                    text("CREATE EXTENSION IF NOT EXISTS vector")
-                )
-            except SQLAlchemyError:
+            if not _execute_ddl_in_savepoint(
+                conn, "CREATE EXTENSION IF NOT EXISTS vector"
+            ):
                 logger.warning(
                     "pgvector extension is not available in %s, "
                     "falling back to array embeddings.",
@@ -233,16 +295,14 @@ def ensure_search_tables(
                 )
             vector_info = _has_vector_columns(conn, schema)
             if vector_info["extension_enabled"]:
-                try:
-                    conn.execute(
-                        text(
-                            f"""
-                            ALTER TABLE {schema}.team_search_embeddings
-                                ADD COLUMN IF NOT EXISTS final_vector_vec vector({vector_dim})
-                            """
-                        )
-                    )
-                except SQLAlchemyError:
+                vector_column_added = _execute_ddl_in_savepoint(
+                    conn,
+                    f"""
+                    ALTER TABLE {schema}.team_search_embeddings
+                        ADD COLUMN IF NOT EXISTS final_vector_vec vector({vector_dim})
+                    """,
+                )
+                if not vector_column_added:
                     logger.warning(
                         "Unable to add pgvector columns in %s, "
                         "keeping array-only embeddings.",
@@ -251,24 +311,44 @@ def ensure_search_tables(
                 else:
                     vector_info = _has_vector_columns(conn, schema)
                     if vector_info["has_final_vector_vec"]:
-                        try:
-                            conn.execute(
-                                text(
-                                    f"""
-                                    CREATE INDEX IF NOT EXISTS
-                                    ix_team_search_embeddings_final_vector_vec_ivfflat
-                                    ON {schema}.team_search_embeddings
-                                    USING ivfflat (final_vector_vec vector_cosine_ops)
-                                    WITH (lists = 100)
-                                    """
-                                )
-                            )
-                        except SQLAlchemyError:
+                        if not _execute_ddl_in_savepoint(
+                            conn,
+                            f"""
+                            CREATE INDEX IF NOT EXISTS
+                            ix_team_search_embeddings_final_vector_vec_ivfflat
+                            ON {schema}.team_search_embeddings
+                            USING ivfflat (final_vector_vec vector_cosine_ops)
+                            WITH (lists = 100)
+                            """,
+                        ):
                             logger.debug(
                                 "Could not create ivfflat index on "
                                 "final_vector_vec for %s.",
                                 schema,
                             )
+
+        # pg_trgm for fuzzy team-name matching.
+        if not _execute_ddl_in_savepoint(
+            conn, "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+        ):
+            logger.info(
+                "pg_trgm extension is not available, "
+                "fuzzy name matching will be disabled.",
+            )
+        else:
+            if not _execute_ddl_in_savepoint(
+                conn,
+                f"""
+                CREATE INDEX IF NOT EXISTS
+                ix_team_search_embeddings_team_name_trgm
+                ON {schema}.team_search_embeddings
+                USING GIN (LOWER(COALESCE(team_name, '')) gin_trgm_ops)
+                """,
+            ):
+                logger.debug(
+                    "Could not create trigram index on team_name for %s.",
+                    schema,
+                )
 
 
 def get_vector_column_info(engine: Engine, schema: str) -> dict:

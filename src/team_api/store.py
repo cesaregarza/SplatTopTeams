@@ -1,17 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import combinations
+import json
 import logging
+import math
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import numpy as np
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from shared_lib.team_vector_utils import (
+    build_identity_idf_lookup,
+    parse_lineup_key,
+    parse_pair_key,
+)
 from team_api.sql import get_vector_column_info, validate_identifier
 
 logger = logging.getLogger(__name__)
@@ -19,12 +29,16 @@ logger = logging.getLogger(__name__)
 
 def _is_missing_relation_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "undefinedtable" in message or "does not exist" in message
+    return (
+        "undefinedtable" in message
+        or "does not exist" in message
+        or "no such table" in message
+    )
 
 
 def _is_missing_column_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "undefinedcolumn" in message or (
+    return "undefinedcolumn" in message or "no such column" in message or (
         "column" in message and "does not exist" in message
     )
 
@@ -39,6 +53,18 @@ def _is_access_error(exc: Exception) -> bool:
 
 
 _NON_ALPHANUMERIC_RE = re.compile(r"[^a-z0-9]+")
+_SENDOU_ROUTE_KEY_TOURNAMENT = "features/tournament/routes/to.$id"
+_SENDOU_TURBO_SPECIAL_VALUES: Dict[int, Any] = {
+    -1: None,
+    -2: True,
+    -3: False,
+    -4: float("nan"),
+    -5: None,
+    -6: float("inf"),
+    -7: None,
+    -8: float("-inf"),
+    -9: -0.0,
+}
 _TOURNAMENT_SCORE_TIERS: tuple[tuple[float, str, str], ...] = (
     (5.0, "X", "x"),
     (10.0, "S+", "s_plus"),
@@ -87,6 +113,183 @@ def _normalize_id_sequence(values: Any) -> List[int]:
     return out
 
 
+def _decode_turbo_stream_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, list) or not payload:
+        return {}
+
+    cache: Dict[int, Any] = {}
+
+    def _decode_value(index: int) -> Any:
+        if index in cache:
+            return cache[index]
+        if index < 0:
+            return _SENDOU_TURBO_SPECIAL_VALUES.get(index)
+        if index >= len(payload):
+            return None
+
+        raw = payload[index]
+        if isinstance(raw, dict):
+            decoded_object: Dict[str, Any] = {}
+            for encoded_key, encoded_value_index in raw.items():
+                if not isinstance(encoded_key, str) or not encoded_key.startswith("_"):
+                    continue
+                try:
+                    key_index = int(encoded_key[1:])
+                    value_index = int(encoded_value_index)
+                except (TypeError, ValueError):
+                    continue
+                real_key = _decode_value(key_index)
+                if real_key is None:
+                    continue
+                decoded_object[str(real_key)] = _decode_value(value_index)
+            cache[index] = decoded_object
+            return decoded_object
+
+        if isinstance(raw, list):
+            decoded_list: List[Any] = []
+            for value in raw:
+                if isinstance(value, int):
+                    decoded_list.append(_decode_value(value))
+                else:
+                    decoded_list.append(value)
+            cache[index] = decoded_list
+            return decoded_list
+
+        return raw
+
+    header = payload[0]
+    if not isinstance(header, dict):
+        return {}
+
+    decoded: Dict[str, Any] = {}
+    for encoded_key, encoded_value_index in header.items():
+        if not isinstance(encoded_key, str) or not encoded_key.startswith("_"):
+            continue
+        try:
+            key_index = int(encoded_key[1:])
+            value_index = int(encoded_value_index)
+        except (TypeError, ValueError):
+            continue
+        key = _decode_value(key_index)
+        if key is None:
+            continue
+        decoded[str(key)] = _decode_value(value_index)
+
+    return decoded
+
+
+def _extract_sendou_teams_from_turbo_payload(payload: Any) -> List[Dict[str, Any]]:
+    decoded = _decode_turbo_stream_payload(payload)
+    route_payload = decoded.get(_SENDOU_ROUTE_KEY_TOURNAMENT)
+    if not isinstance(route_payload, dict):
+        return []
+
+    route_data = route_payload.get("data")
+    if isinstance(route_data, str):
+        try:
+            route_data = json.loads(route_data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+
+    if not isinstance(route_data, dict):
+        return []
+
+    teams = (
+        route_data.get("tournament", {})
+        .get("ctx", {})
+        .get("teams", [])
+    )
+    if not isinstance(teams, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for team in teams:
+        if not isinstance(team, dict):
+            continue
+        team_id = team.get("id")
+        team_name = str(team.get("name") or "").strip()
+        member_ids: List[int] = []
+        member_names: List[str] = []
+        seen_member_ids: set[int] = set()
+        seen_member_names: set[str] = set()
+        for member in team.get("members", []) or []:
+            if not isinstance(member, dict):
+                continue
+
+            member_user_id = member.get("userId")
+            if isinstance(member_user_id, (int, float)):
+                parsed_member_id = int(member_user_id)
+                if parsed_member_id > 0 and parsed_member_id not in seen_member_ids:
+                    seen_member_ids.add(parsed_member_id)
+                    member_ids.append(parsed_member_id)
+
+            for name_key in ("username", "inGameName"):
+                raw_member_name = str(member.get(name_key) or "").strip()
+                if not raw_member_name:
+                    continue
+                dedupe_member_name = raw_member_name.lower()
+                if dedupe_member_name in seen_member_names:
+                    continue
+                seen_member_names.add(dedupe_member_name)
+                member_names.append(raw_member_name)
+
+        if team_name:
+            display_name = team_name
+        elif member_names:
+            preview = " / ".join(member_names[:3])
+            if len(member_names) > 3:
+                preview += f" +{len(member_names) - 3}"
+            display_name = f"[No team name] {preview}"
+        elif isinstance(team_id, (int, float)):
+            display_name = f"Untitled team {int(team_id)}"
+        else:
+            display_name = "Untitled team"
+
+        normalized: Dict[str, Any] = {
+            "team_id": int(team_id) if isinstance(team_id, (int, float)) else None,
+            "team_name": team_name,
+            "display_name": display_name,
+            "member_user_ids": member_ids,
+            "member_names": member_names,
+        }
+        out.append(normalized)
+    return out
+
+
+def _sendou_team_matches_query(
+    team: Dict[str, Any],
+    *,
+    normalized_query: str,
+    token_query: set[str],
+) -> bool:
+    if not normalized_query:
+        return True
+
+    candidates = []
+    for key in ("team_name", "display_name"):
+        raw = str(team.get(key) or "").strip()
+        if raw:
+            candidates.append(raw)
+    for raw_member_name in team.get("member_names", []) or []:
+        raw = str(raw_member_name or "").strip()
+        if raw:
+            candidates.append(raw)
+
+    for candidate in candidates:
+        normalized_candidate = _normalize_query(candidate)
+        token_candidate = set(_tokenized_query(candidate))
+        if normalized_query == normalized_candidate:
+            return True
+        if normalized_query and normalized_query in normalized_candidate:
+            return True
+        if len(normalized_query) <= 4 and normalized_query in token_candidate:
+            return True
+        if token_query and token_query.issubset(token_candidate):
+            return True
+
+    return False
+
+
 def _tournament_tier(value: Any) -> dict[str, str]:
     parsed = None
     try:
@@ -133,6 +336,12 @@ class EmbeddingRow:
     effective_lineups: float = 0.0
     top_lineup_player_ids: tuple[int, ...] = ()
     top_lineup_player_names: tuple[str, ...] = ()
+    roster_player_ids: tuple[int, ...] = ()
+    roster_player_names: tuple[str, ...] = ()
+    roster_player_match_counts: tuple[int, ...] = ()
+    player_support: dict[int, float] = field(default_factory=dict)
+    pair_support: dict[tuple[int, int], float] = field(default_factory=dict)
+    lineup_variant_counts: dict[tuple[int, ...], int] = field(default_factory=dict)
     tournament_count: int = 0
 
 
@@ -145,6 +354,12 @@ class EmbeddingSnapshotCacheEntry:
     identities: np.ndarray
     lineup_counts: np.ndarray
     index_by_team_id: Dict[int, int]
+    team_ids_by_player_id: Dict[int, tuple[int, ...]]
+    idf_lookup: Dict[int, float]
+    semantic_dim: int
+    identity_dim: int
+    identity_beta: float
+    identity_idf_cap: float
     built_at_ms: int
 
 
@@ -172,6 +387,26 @@ class TeamSearchStore:
         self._embedding_snapshot_cache: Optional[EmbeddingSnapshotCacheEntry] = None
         self._cluster_map_cache: Dict[tuple[int, str], Dict[int, Dict[str, Any]]] = {}
         self._tournament_count_cache: Dict[tuple[int, int], int] = {}
+        self._sendou_tournament_team_cache: Dict[int, List[Dict[str, Any]]] = {}
+        self._has_trgm: Optional[bool] = None
+
+    def _detect_trgm_support(self) -> bool:
+        if self._has_trgm is not None:
+            return self._has_trgm
+        try:
+            with self.engine.connect() as conn:
+                self._has_trgm = bool(
+                    conn.execute(
+                        text(
+                            "SELECT EXISTS("
+                            "SELECT 1 FROM pg_extension WHERE extname='pg_trgm'"
+                            ")"
+                        )
+                    ).scalar_one()
+                )
+        except SQLAlchemyError:
+            self._has_trgm = False
+        return self._has_trgm
 
     @staticmethod
     def _rank_similar_teams(
@@ -180,7 +415,16 @@ class TeamSearchStore:
         cluster_map: Dict[int, Dict[str, object]],
         top_n: int,
         min_relevance: float,
+        candidate_top_n: Optional[int] = None,
         cache_entry: Optional[EmbeddingSnapshotCacheEntry] = None,
+        recency_weight: float = 0.0,
+        query_team_weights: Optional[Dict[int, float]] = None,
+        query_profile: Optional[Dict[str, object]] = None,
+        rerank_candidate_limit: int = 200,
+        rerank_weight_embed: float = 0.70,
+        rerank_weight_player: float = 0.15,
+        rerank_weight_pair: float = 0.15,
+        use_pair_rerank: bool = True,
     ) -> Dict[str, object]:
         from team_api.search_logic import rank_similar_teams
 
@@ -190,12 +434,42 @@ class TeamSearchStore:
             target_team_ids=target_team_ids,
             cluster_map=cluster_map,
             top_n=top_n,
+            candidate_top_n=candidate_top_n,
             min_relevance=min_relevance,
+            recency_weight=recency_weight,
+            query_team_weights=query_team_weights,
+            query_profile=query_profile,
+            rerank_candidate_limit=rerank_candidate_limit,
+            rerank_weight_embed=rerank_weight_embed,
+            rerank_weight_player=rerank_weight_player,
+            rerank_weight_pair=rerank_weight_pair,
+            use_pair_rerank=use_pair_rerank,
             precomputed_finals=cache_entry.finals if use_cached_arrays else None,
             precomputed_semantics=cache_entry.semantics if use_cached_arrays else None,
             precomputed_identities=cache_entry.identities if use_cached_arrays else None,
             precomputed_index=cache_entry.index_by_team_id if use_cached_arrays else None,
         )
+
+    @staticmethod
+    def _consolidation_candidate_top_n(
+        top_n: int,
+        rerank_candidate_limit: int,
+    ) -> int:
+        requested = max(1, int(top_n))
+        limit = max(requested, int(rerank_candidate_limit))
+        return min(limit, max(requested + 10, requested * 5))
+
+    @staticmethod
+    def _finalize_ranked_results(
+        ranked: Dict[str, Any],
+        *,
+        top_n: int,
+    ) -> Dict[str, Any]:
+        trimmed = list(ranked.get("results") or [])[: max(1, int(top_n))]
+        for rank, result in enumerate(trimmed, start=1):
+            result["rank"] = rank
+        ranked["results"] = trimmed
+        return ranked
 
     @staticmethod
     def _normalize_vector(vec: np.ndarray) -> np.ndarray:
@@ -1380,6 +1654,35 @@ class TeamSearchStore:
         if not unique_ids:
             return []
 
+        sql_with_roster = f"""
+            SELECT
+                team_id,
+                tournament_id,
+                team_name,
+                event_time_ms,
+                lineup_count,
+                tournament_count,
+                unique_player_count,
+                distinct_lineup_count,
+                top_lineup_share,
+                lineup_entropy,
+                effective_lineups,
+                semantic_vector,
+                identity_vector,
+                final_vector,
+                top_lineup_summary,
+                top_lineup_player_ids,
+                top_lineup_player_names,
+                roster_player_ids,
+                roster_player_names,
+                roster_player_match_counts,
+                player_support,
+                pair_support,
+                lineup_variant_counts
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+              AND team_id IN :team_ids
+        """
         sql_with_players = f"""
             SELECT
                 team_id,
@@ -1442,7 +1745,7 @@ class TeamSearchStore:
         with self.engine.connect() as conn:
             try:
                 rows = conn.execute(
-                    text(sql_with_players).bindparams(bindparam("team_ids", expanding=True)),
+                    text(sql_with_roster).bindparams(bindparam("team_ids", expanding=True)),
                     {"snapshot_id": int(snapshot_id), "team_ids": unique_ids},
                 ).mappings().all()
             except SQLAlchemyError as exc:
@@ -1455,15 +1758,15 @@ class TeamSearchStore:
                 if _is_missing_column_error(exc):
                     try:
                         rows = conn.execute(
-                            text(sql_legacy).bindparams(
-                                bindparam("team_ids", expanding=True)
-                            ),
+                            text(sql_with_players).bindparams(bindparam("team_ids", expanding=True)),
                             {"snapshot_id": int(snapshot_id), "team_ids": unique_ids},
                         ).mappings().all()
                     except SQLAlchemyError as nested_exc:
-                        if _is_missing_column_error(nested_exc):
+                        if not _is_missing_column_error(nested_exc):
+                            raise
+                        try:
                             rows = conn.execute(
-                                text(sql_core).bindparams(
+                                text(sql_legacy).bindparams(
                                     bindparam("team_ids", expanding=True)
                                 ),
                                 {
@@ -1471,8 +1774,19 @@ class TeamSearchStore:
                                     "team_ids": unique_ids,
                                 },
                             ).mappings().all()
-                        else:
-                            raise
+                        except SQLAlchemyError as legacy_exc:
+                            if _is_missing_column_error(legacy_exc):
+                                rows = conn.execute(
+                                    text(sql_core).bindparams(
+                                        bindparam("team_ids", expanding=True)
+                                    ),
+                                    {
+                                        "snapshot_id": int(snapshot_id),
+                                        "team_ids": unique_ids,
+                                    },
+                                ).mappings().all()
+                            else:
+                                raise
                 else:
                     raise
 
@@ -1483,20 +1797,37 @@ class TeamSearchStore:
         for r in row_dicts:
             r.setdefault("top_lineup_player_ids", [])
             r.setdefault("top_lineup_player_names", [])
+            r.setdefault("roster_player_ids", [])
+            r.setdefault("roster_player_names", [])
+            r.setdefault("roster_player_match_counts", [])
+            r.setdefault("player_support", {})
+            r.setdefault("pair_support", {})
+            r.setdefault("lineup_variant_counts", {})
             out.append(self._row_to_embedding(r))
         return out
 
     def _query_vector_rank(
         self,
         snapshot_id: int,
-        query_rows: List[EmbeddingRow],
+        query_rows: Optional[List[EmbeddingRow]],
         target_team_ids: List[int],
         cluster_map: Dict[int, Dict[str, object]],
         top_n: int,
         min_relevance: float,
+        candidate_top_n: Optional[int] = None,
+        recency_weight: float = 0.0,
+        query_team_weights: Optional[Dict[int, float]] = None,
+        query_profile: Optional[Dict[str, object]] = None,
+        rerank_candidate_limit: int = 200,
+        rerank_weight_embed: float = 0.70,
+        rerank_weight_player: float = 0.15,
+        rerank_weight_pair: float = 0.15,
+        use_pair_rerank: bool = True,
     ) -> Optional[Dict[str, object]]:
-        if not query_rows:
+        if query_profile is None and not query_rows:
             return None
+
+        from team_api.search_logic import build_query_similarity_profile
 
         vector_info = self._detect_vector_support()
         if not (
@@ -1506,15 +1837,30 @@ class TeamSearchStore:
         ):
             return None
 
-        query_final = np.stack([row.final_vector for row in query_rows], axis=0)
-        weights = np.asarray([row.lineup_count for row in query_rows], dtype=np.float64)
-
-        query_final_centroid = self._weighted_centroid(query_final, weights)
-        if query_final_centroid.size == 0:
+        if query_profile is None:
+            query_finals = np.stack([row.final_vector for row in query_rows], axis=0)
+            query_semantics = np.stack([row.semantic_vector for row in query_rows], axis=0)
+            query_identities = np.stack([row.identity_vector for row in query_rows], axis=0)
+            query_profile = build_query_similarity_profile(
+                query_rows,
+                list(range(len(query_rows))),
+                query_finals,
+                query_semantics,
+                query_identities,
+                query_team_weights=query_team_weights,
+            )
+        else:
+            query_profile = dict(query_profile)
+        ann_query_vector = np.asarray(
+            query_profile["ann_query_vector"],
+            dtype=np.float64,
+        )
+        if ann_query_vector.size == 0:
             return None
+        query_semantic_weight = float(query_profile.get("semantic_weight") or 0.5)
 
         vector_dim = int(vector_info["final_vector_vec_dim"])
-        target_dim = int(query_final_centroid.size)
+        target_dim = int(ann_query_vector.size)
         if vector_dim != target_dim:
             logger.warning(
                 "Skipping ANN query in %s due vector dimension mismatch: db=%s query=%s",
@@ -1524,8 +1870,50 @@ class TeamSearchStore:
             )
             return None
 
-        candidate_limit = max(120, min(3000, int(top_n) * 40))
-        sql = f"""
+        selection_top_n = (
+            max(int(top_n), int(candidate_top_n))
+            if candidate_top_n is not None
+            else int(top_n)
+        )
+        candidate_limit = max(
+            160,
+            min(
+                4000,
+                selection_top_n * int(round(40.0 * (1.0 + query_semantic_weight))),
+            ),
+        )
+        sql_with_roster = f"""
+            SELECT
+                team_id,
+                tournament_id,
+                team_name,
+                event_time_ms,
+                lineup_count,
+                tournament_count,
+                unique_player_count,
+                distinct_lineup_count,
+                top_lineup_share,
+                lineup_entropy,
+                effective_lineups,
+                semantic_vector,
+                identity_vector,
+                final_vector,
+                top_lineup_summary,
+                top_lineup_player_ids,
+                top_lineup_player_names,
+                roster_player_ids,
+                roster_player_names,
+                roster_player_match_counts,
+                player_support,
+                pair_support,
+                lineup_variant_counts
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+              AND final_vector_vec IS NOT NULL
+            ORDER BY final_vector_vec <=> CAST(:query_vector AS vector({vector_dim}))
+            LIMIT :candidate_limit
+        """
+        sql_with_players = f"""
             SELECT
                 team_id,
                 tournament_id,
@@ -1550,7 +1938,37 @@ class TeamSearchStore:
             ORDER BY final_vector_vec <=> CAST(:query_vector AS vector({vector_dim}))
             LIMIT :candidate_limit
         """
-        sql_without_tournament_count = f"""
+        sql_without_tournament_count_with_roster = f"""
+            SELECT
+                team_id,
+                tournament_id,
+                team_name,
+                event_time_ms,
+                lineup_count,
+                unique_player_count,
+                distinct_lineup_count,
+                top_lineup_share,
+                lineup_entropy,
+                effective_lineups,
+                semantic_vector,
+                identity_vector,
+                final_vector,
+                top_lineup_summary,
+                top_lineup_player_ids,
+                top_lineup_player_names,
+                roster_player_ids,
+                roster_player_names,
+                roster_player_match_counts,
+                player_support,
+                pair_support,
+                lineup_variant_counts
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+              AND final_vector_vec IS NOT NULL
+            ORDER BY final_vector_vec <=> CAST(:query_vector AS vector({vector_dim}))
+            LIMIT :candidate_limit
+        """
+        sql_without_tournament_count_with_players = f"""
             SELECT
                 team_id,
                 tournament_id,
@@ -1593,52 +2011,38 @@ class TeamSearchStore:
         """
 
         with self.engine.connect() as conn:
-            try:
-                candidate_rows = conn.execute(
-                    text(sql),
-                    {
-                        "snapshot_id": int(snapshot_id),
-                        "query_vector": self._vector_literal(query_final_centroid),
-                        "candidate_limit": int(candidate_limit),
-                    },
-                ).mappings().all()
-            except SQLAlchemyError as exc:
-                if _is_missing_column_error(exc):
-                    try:
-                        candidate_rows = conn.execute(
-                            text(sql_without_tournament_count),
-                            {
-                                "snapshot_id": int(snapshot_id),
-                                "query_vector": self._vector_literal(query_final_centroid),
-                                "candidate_limit": int(candidate_limit),
-                            },
-                        ).mappings().all()
-                    except SQLAlchemyError as nested_exc:
-                        if _is_missing_column_error(nested_exc):
-                            candidate_rows = conn.execute(
-                                text(sql_core),
-                                {
-                                    "snapshot_id": int(snapshot_id),
-                                    "query_vector": self._vector_literal(
-                                        query_final_centroid
-                                    ),
-                                    "candidate_limit": int(candidate_limit),
-                                },
-                            ).mappings().all()
-                        else:
-                            logger.warning(
-                                "Vector ANN query failed in %s; falling back to in-memory search: %s",
-                                self.schema,
-                                exc,
-                            )
-                            return None
-                else:
+            params = {
+                "snapshot_id": int(snapshot_id),
+                "query_vector": self._vector_literal(ann_query_vector),
+                "candidate_limit": int(candidate_limit),
+            }
+            query_plan = (
+                sql_with_roster,
+                sql_with_players,
+                sql_without_tournament_count_with_roster,
+                sql_without_tournament_count_with_players,
+                sql_core,
+            )
+            candidate_rows = None
+            for query_sql in query_plan:
+                try:
+                    candidate_rows = conn.execute(
+                        text(query_sql),
+                        params,
+                    ).mappings().all()
+                    break
+                except SQLAlchemyError as exc:
+                    if _is_missing_column_error(exc):
+                        continue
                     logger.warning(
                         "Vector ANN query failed in %s; falling back to in-memory search: %s",
                         self.schema,
                         exc,
                     )
                     return None
+
+            if candidate_rows is None:
+                return None
 
         candidates: List[EmbeddingRow] = []
         seen: set[int] = set()
@@ -1647,11 +2051,17 @@ class TeamSearchStore:
         for r in candidate_dicts:
             r.setdefault("top_lineup_player_ids", [])
             r.setdefault("top_lineup_player_names", [])
+            r.setdefault("roster_player_ids", [])
+            r.setdefault("roster_player_names", [])
+            r.setdefault("roster_player_match_counts", [])
+            r.setdefault("player_support", {})
+            r.setdefault("pair_support", {})
+            r.setdefault("lineup_variant_counts", {})
             item = self._row_to_embedding(r)
             seen.add(item.team_id)
             candidates.append(item)
 
-        for row in query_rows:
+        for row in query_rows or []:
             if int(row.team_id) not in seen:
                 candidates.append(row)
                 seen.add(int(row.team_id))
@@ -1664,7 +2074,16 @@ class TeamSearchStore:
             target_team_ids=target_team_ids,
             cluster_map=cluster_map,
             top_n=top_n,
+            candidate_top_n=candidate_top_n,
             min_relevance=min_relevance,
+            recency_weight=recency_weight,
+            query_team_weights=query_team_weights,
+            query_profile=query_profile,
+            rerank_candidate_limit=rerank_candidate_limit,
+            rerank_weight_embed=rerank_weight_embed,
+            rerank_weight_player=rerank_weight_player,
+            rerank_weight_pair=rerank_weight_pair,
+            use_pair_rerank=use_pair_rerank,
         )
         if ranked["results"]:
             return ranked
@@ -1677,8 +2096,259 @@ class TeamSearchStore:
             target_team_ids=target_team_ids,
             cluster_map=cluster_map,
             top_n=top_n,
+            candidate_top_n=candidate_top_n,
             min_relevance=0.0,
+            recency_weight=recency_weight,
+            query_team_weights=query_team_weights,
+            query_profile=query_profile,
+            rerank_candidate_limit=rerank_candidate_limit,
+            rerank_weight_embed=rerank_weight_embed,
+            rerank_weight_player=rerank_weight_player,
+            rerank_weight_pair=rerank_weight_pair,
+            use_pair_rerank=use_pair_rerank,
         )
+
+    @staticmethod
+    def _build_seed_player_query_profile(
+        cache_entry: EmbeddingSnapshotCacheEntry,
+        player_ids: Sequence[int],
+    ) -> Optional[Dict[str, object]]:
+        seed_player_ids = _normalize_id_sequence(player_ids)
+        if not seed_player_ids:
+            return None
+
+        from team_api.search_logic import build_player_query_profile
+
+        return build_player_query_profile(
+            seed_player_ids,
+            semantic_dim=cache_entry.semantic_dim,
+            identity_dim=cache_entry.identity_dim,
+            identity_beta=cache_entry.identity_beta,
+            idf_lookup=cache_entry.idf_lookup,
+        )
+
+    @staticmethod
+    def _player_seed_query_profile(
+        query_rows: Sequence[EmbeddingRow],
+        player_ids: Sequence[int],
+    ) -> tuple[List[EmbeddingRow], Optional[Dict[int, float]], Dict[str, int]]:
+        seed_player_ids = _normalize_id_sequence(player_ids)
+        if not query_rows or not seed_player_ids:
+            return list(query_rows), None, {}
+
+        seed_set = set(seed_player_ids)
+        metrics: List[Dict[str, Any]] = []
+        for row in query_rows:
+            roster_ids = set(
+                _normalize_id_sequence(row.roster_player_ids or row.top_lineup_player_ids)
+            )
+            if not roster_ids:
+                continue
+
+            overlap_count = len(seed_set & roster_ids)
+            if overlap_count <= 0:
+                continue
+
+            roster_size = max(1, len(roster_ids))
+            seed_size = max(1, len(seed_set))
+            precision = overlap_count / float(roster_size)
+            recall = overlap_count / float(seed_size)
+            denom = precision + recall
+            f1 = (2.0 * precision * recall / denom) if denom > 0.0 else 0.0
+
+            # Strongly favor near-complete roster matches while still allowing
+            # one-player drift for larger friend groups.
+            score = (f1 * f1) * (1.0 + recall)
+            metrics.append(
+                {
+                    "row": row,
+                    "overlap_count": int(overlap_count),
+                    "score": float(score),
+                    "lineup_count": int(row.lineup_count or 0),
+                }
+            )
+
+        if not metrics:
+            return list(query_rows), None, {}
+
+        metrics.sort(
+            key=lambda item: (
+                -int(item["overlap_count"]),
+                -float(item["score"]),
+                -int(item["lineup_count"]),
+                int(item["row"].team_id),
+            )
+        )
+        max_overlap = int(metrics[0]["overlap_count"])
+        min_overlap = max(1, max_overlap - 1)
+        max_score = float(metrics[0]["score"])
+
+        strong = [
+            item
+            for item in metrics
+            if int(item["overlap_count"]) >= min_overlap
+            and float(item["score"]) >= (max_score * 0.40)
+        ]
+        selected = strong[:24] if strong else metrics[:12]
+
+        selected_rows = [item["row"] for item in selected]
+        query_team_weights = {
+            int(item["row"].team_id): max(float(item["score"]), 1e-6)
+            for item in selected
+        }
+        metadata = {
+            "seed_player_max_overlap": max_overlap,
+            "seed_player_query_team_count": len(selected_rows),
+        }
+        return selected_rows, query_team_weights, metadata
+
+    @staticmethod
+    def _match_targets_by_player_ids_from_cache(
+        cache_entry: EmbeddingSnapshotCacheEntry,
+        player_ids: Sequence[int],
+        *,
+        limit: int = 240,
+    ) -> List[int]:
+        normalized_player_ids = _normalize_id_sequence(player_ids)
+        if not normalized_player_ids or not cache_entry.rows:
+            return []
+
+        overlap_count_by_team_id: Dict[int, int] = {}
+        for player_id in normalized_player_ids:
+            for team_id in cache_entry.team_ids_by_player_id.get(int(player_id), ()):
+                overlap_count_by_team_id[int(team_id)] = (
+                    overlap_count_by_team_id.get(int(team_id), 0) + 1
+                )
+
+        if not overlap_count_by_team_id:
+            return []
+
+        ordered_team_ids = sorted(
+            overlap_count_by_team_id.keys(),
+            key=lambda team_id: (
+                -int(overlap_count_by_team_id[team_id]),
+                -int(
+                    cache_entry.rows[cache_entry.index_by_team_id[int(team_id)]].lineup_count
+                ),
+                int(team_id),
+            ),
+        )
+        max_limit = max(1, min(int(limit), 2000))
+        return ordered_team_ids[:max_limit]
+
+    def _project_seed_players_to_proxy_teams(
+        self,
+        snapshot_id: int,
+        player_ids: Sequence[int],
+        *,
+        subset_size: int = 4,
+        per_subset_limit: int = 12,
+        max_subsets: int = 96,
+        final_limit: int = 64,
+    ) -> tuple[List[EmbeddingRow], Optional[Dict[int, float]], Dict[str, int]]:
+        normalized_player_ids = _normalize_id_sequence(player_ids)
+        if len(normalized_player_ids) <= max(1, int(subset_size)):
+            return [], None, {}
+
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        if not cache_entry.rows:
+            return [], None, {}
+
+        subset_k = max(1, min(int(subset_size), len(normalized_player_ids)))
+        total_possible_subsets = math.comb(len(normalized_player_ids), subset_k)
+        team_score_by_id: Dict[int, float] = {}
+        team_support_by_id: Dict[int, int] = {}
+        subsets_processed = 0
+        subsets_with_hits = 0
+
+        for subset in combinations(normalized_player_ids, subset_k):
+            if subsets_processed >= max_subsets:
+                break
+            subsets_processed += 1
+
+            candidate_team_ids = self._match_targets_by_player_ids_from_cache(
+                cache_entry,
+                subset,
+                limit=per_subset_limit,
+            )
+            if not candidate_team_ids:
+                continue
+
+            candidate_rows = [
+                cache_entry.rows[cache_entry.index_by_team_id[int(team_id)]]
+                for team_id in candidate_team_ids
+                if int(team_id) in cache_entry.index_by_team_id
+            ]
+            subset_rows, subset_weights, _ = self._player_seed_query_profile(
+                candidate_rows,
+                subset,
+            )
+            if not subset_rows or not subset_weights:
+                continue
+
+            max_subset_weight = max(float(weight) for weight in subset_weights.values())
+            if max_subset_weight <= 0.0:
+                continue
+
+            subsets_with_hits += 1
+            for row in subset_rows:
+                team_id = int(row.team_id)
+                normalized_weight = (
+                    float(subset_weights.get(team_id, 0.0)) / max_subset_weight
+                )
+                if normalized_weight <= 0.0:
+                    continue
+                team_score_by_id[team_id] = (
+                    team_score_by_id.get(team_id, 0.0) + normalized_weight
+                )
+                team_support_by_id[team_id] = team_support_by_id.get(team_id, 0) + 1
+
+        if not team_score_by_id:
+            return [], None, {
+                "seed_player_projection_subset_size": subset_k,
+                "seed_player_projection_subset_count": subsets_processed,
+                "seed_player_projection_hit_count": 0,
+                "seed_player_projection_team_count": 0,
+                "seed_player_projection_total_possible_subsets": total_possible_subsets,
+            }
+
+        ordered_team_ids = sorted(
+            team_score_by_id.keys(),
+            key=lambda team_id: (
+                -float(team_score_by_id[team_id]),
+                -int(team_support_by_id.get(team_id, 0)),
+                -int(
+                    cache_entry.rows[cache_entry.index_by_team_id[int(team_id)]].lineup_count
+                ),
+                int(team_id),
+            ),
+        )
+
+        top_score = float(team_score_by_id[ordered_team_ids[0]])
+        selected_team_ids = [
+            int(team_id)
+            for team_id in ordered_team_ids
+            if float(team_score_by_id[team_id]) >= max(0.5, top_score * 0.25)
+        ][: max(1, int(final_limit))]
+
+        query_rows = [
+            cache_entry.rows[cache_entry.index_by_team_id[int(team_id)]]
+            for team_id in selected_team_ids
+        ]
+        query_team_weights = {
+            int(team_id): float(team_score_by_id[team_id])
+            for team_id in selected_team_ids
+        }
+        metadata = {
+            "seed_player_projection_subset_size": subset_k,
+            "seed_player_projection_subset_count": subsets_processed,
+            "seed_player_projection_hit_count": subsets_with_hits,
+            "seed_player_projection_team_count": len(selected_team_ids),
+            "seed_player_projection_total_possible_subsets": total_possible_subsets,
+        }
+        if subsets_processed < total_possible_subsets:
+            metadata["seed_player_projection_truncated"] = 1
+        return query_rows, query_team_weights, metadata
 
     def search_similar_teams(
         self,
@@ -1690,12 +2360,45 @@ class TeamSearchStore:
         include_clusters: bool,
         consolidate: bool = True,
         consolidate_min_overlap: float = 0.8,
+        tournament_id: Optional[int] = None,
+        seed_player_ids: Optional[Sequence[int]] = None,
+        recency_weight: float = 0.0,
+        query_mode: str = "whole_set",
+        use_pair_rerank: bool = True,
+        use_cluster_profile_scoring: bool = True,
+        rerank_candidate_limit: int = 200,
+        rerank_weight_embed: float = 0.70,
+        rerank_weight_player: float = 0.15,
+        rerank_weight_pair: float = 0.15,
     ) -> Dict[str, object]:
+        from team_api.search_logic import (
+            consolidate_ranked_results,
+            rescore_consolidated_results,
+            strip_internal_result_fields,
+        )
+
         start_total = time.perf_counter()
+        query_tournament_id = (
+            int(tournament_id) if tournament_id is not None else None
+        )
+        explicit_seed_player_ids = _normalize_id_sequence(seed_player_ids or [])
+        normalized_query_mode = (
+            "subset_enum"
+            if str(query_mode or "").strip().lower() == "subset_enum"
+            else "whole_set"
+        )
+        query_source = "dataset"
+        sendou_name_matches: List[str] = []
+        sendou_player_ids_used: List[int] = []
+        resolved_query_player_ids = list(explicit_seed_player_ids)
+        query_team_weights: Optional[Dict[int, float]] = None
+        seed_query_metadata: Dict[str, int] = {}
+        direct_query_profile: Optional[Dict[str, object]] = None
         target_ids = self.match_targets(
             snapshot_id=snapshot_id,
             query=query,
             limit=max(1, min(int(top_n), 60)),
+            tournament_id=query_tournament_id,
         )
         cluster_map = (
             self._get_cached_cluster_map(snapshot_id, cluster_mode)
@@ -1704,7 +2407,136 @@ class TeamSearchStore:
         )
 
         query_rows = self._fetch_embeddings_by_team_ids(snapshot_id, target_ids)
-        if not query_rows:
+        if not query_rows and (
+            query_tournament_id is not None or explicit_seed_player_ids
+        ):
+            sendou_player_ids = list(explicit_seed_player_ids)
+            used_explicit_player_seed = bool(explicit_seed_player_ids)
+            if query_tournament_id is not None:
+                sendou_team_matches = self._match_sendou_tournament_teams(
+                    query_tournament_id,
+                    query,
+                    limit=max(1, min(int(top_n) * 12, 700)),
+                )
+                sendou_name_matches = [
+                    str(team.get("team_name") or team.get("display_name") or "").strip()
+                    for team in sendou_team_matches
+                    if str(team.get("team_name") or team.get("display_name") or "").strip()
+                ]
+                sendou_player_ids = _normalize_id_sequence(
+                    [
+                        *sendou_player_ids,
+                        *[
+                            player_id
+                            for team in sendou_team_matches
+                            for player_id in (team.get("member_user_ids") or [])
+                        ],
+                    ]
+                )
+                resolved_query_player_ids = list(sendou_player_ids)
+
+            fallback_target_ids: List[int] = []
+            if sendou_name_matches:
+                for team_name in sendou_name_matches:
+                    fallback_target_ids.extend(
+                        self.match_targets(
+                            snapshot_id=snapshot_id,
+                            query=team_name,
+                            limit=12,
+                        )
+                    )
+            used_name_fallback = bool(fallback_target_ids)
+
+            if sendou_player_ids:
+                if normalized_query_mode == "whole_set" and not target_ids:
+                    sendou_player_ids_used = sendou_player_ids
+                else:
+                    player_seed_ids = self._match_targets_by_player_ids(
+                        snapshot_id=snapshot_id,
+                        player_ids=sendou_player_ids,
+                        limit=max(120, int(top_n) * 24),
+                    )
+                    if player_seed_ids:
+                        sendou_player_ids_used = sendou_player_ids
+                        fallback_target_ids.extend(player_seed_ids)
+            used_player_fallback = bool(sendou_player_ids_used)
+
+            deduped_target_ids = _normalize_id_sequence(fallback_target_ids)
+            if deduped_target_ids:
+                query_rows = self._fetch_embeddings_by_team_ids(
+                    snapshot_id,
+                    deduped_target_ids[:240],
+                )
+            if used_player_fallback:
+                query_source = (
+                    "seed_players"
+                    if used_explicit_player_seed
+                    else "sendou_players"
+                )
+            elif used_name_fallback:
+                query_source = "sendou_names"
+            elif query_tournament_id is not None:
+                query_source = "sendou"
+
+        player_seed_ids_for_weighting = (
+            list(resolved_query_player_ids)
+            if resolved_query_player_ids
+            else list(sendou_player_ids_used)
+        )
+        cache_entry: Optional[EmbeddingSnapshotCacheEntry] = None
+        if player_seed_ids_for_weighting and normalized_query_mode == "whole_set":
+            cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+            direct_query_profile = self._build_seed_player_query_profile(
+                cache_entry,
+                player_seed_ids_for_weighting,
+            )
+            seed_query_metadata["seed_player_projection_subset_count"] = 0
+            seed_query_metadata["subset_enumeration_count"] = 0
+        elif not target_ids and len(player_seed_ids_for_weighting) > 4:
+            (
+                projected_rows,
+                projected_weights,
+                projected_metadata,
+            ) = self._project_seed_players_to_proxy_teams(
+                snapshot_id,
+                player_seed_ids_for_weighting,
+            )
+            if projected_rows and projected_weights:
+                query_rows = projected_rows
+                query_team_weights = projected_weights
+                seed_query_metadata.update(projected_metadata)
+                seed_query_metadata["subset_enumeration_count"] = int(
+                    projected_metadata.get("seed_player_projection_subset_count", 0)
+                )
+                if explicit_seed_player_ids:
+                    query_source = "seed_player_subsets"
+                elif sendou_player_ids_used:
+                    query_source = "sendou_player_subsets"
+
+        if (
+            normalized_query_mode == "subset_enum"
+            and query_rows
+            and player_seed_ids_for_weighting
+            and query_team_weights is None
+        ):
+            query_rows, query_team_weights, seed_query_metadata = self._player_seed_query_profile(
+                query_rows,
+                player_seed_ids_for_weighting,
+            )
+
+        if not query_rows and direct_query_profile is None:
+            query_context: Dict[str, Any] = {
+                "matched_team_ids": [],
+                "matched_team_names": [],
+                "query_mode": normalized_query_mode,
+            }
+            if query_tournament_id is not None:
+                query_context["tournament_id"] = query_tournament_id
+                query_context["tournament_source"] = query_source
+                query_context["tournament_team_name_matches"] = sendou_name_matches
+                query_context["tournament_player_id_count"] = len(sendou_player_ids_used)
+            query_context["seed_player_id_count"] = len(explicit_seed_player_ids)
+            query_context.update(seed_query_metadata)
             logger.debug(
                 "team_search schema=%s snapshot_id=%s mode=empty query=%r elapsed_ms=%.1f",
                 self.schema,
@@ -1713,29 +2545,96 @@ class TeamSearchStore:
                 (time.perf_counter() - start_total) * 1000.0,
             )
             return {
-                "query": {"matched_team_ids": [], "matched_team_names": []},
+                "query": query_context,
                 "results": [],
             }
 
         target_ids = [int(row.team_id) for row in query_rows]
+        consolidation_candidate_top_n = (
+            self._consolidation_candidate_top_n(top_n, rerank_candidate_limit)
+            if consolidate
+            else top_n
+        )
 
         ranked = self._query_vector_rank(
             snapshot_id=snapshot_id,
-            query_rows=query_rows,
+            query_rows=query_rows or None,
             target_team_ids=target_ids,
             cluster_map=cluster_map,
             top_n=top_n,
+            candidate_top_n=consolidation_candidate_top_n,
             min_relevance=min_relevance,
+            recency_weight=recency_weight,
+            query_team_weights=query_team_weights,
+            query_profile=direct_query_profile,
+            rerank_candidate_limit=rerank_candidate_limit,
+            rerank_weight_embed=rerank_weight_embed,
+            rerank_weight_player=rerank_weight_player,
+            rerank_weight_pair=rerank_weight_pair,
+            use_pair_rerank=use_pair_rerank,
         )
 
         if ranked is not None:
-            if consolidate:
-                from team_api.search_logic import consolidate_ranked_results
+            # Adaptive relevance for ANN path.
+            if (
+                len(ranked.get("results", [])) < 3
+                and min_relevance > 0.5
+            ):
+                relaxed = self._query_vector_rank(
+                    snapshot_id=snapshot_id,
+                    query_rows=query_rows or None,
+                    target_team_ids=target_ids,
+                    cluster_map=cluster_map,
+                    top_n=top_n,
+                    candidate_top_n=consolidation_candidate_top_n,
+                    min_relevance=max(0.5, min_relevance - 0.2),
+                    recency_weight=recency_weight,
+                    query_team_weights=query_team_weights,
+                    query_profile=direct_query_profile,
+                    rerank_candidate_limit=rerank_candidate_limit,
+                    rerank_weight_embed=rerank_weight_embed,
+                    rerank_weight_player=rerank_weight_player,
+                    rerank_weight_pair=rerank_weight_pair,
+                    use_pair_rerank=use_pair_rerank,
+                )
+                if relaxed is not None and len(
+                    relaxed.get("results", [])
+                ) > len(ranked.get("results", [])):
+                    ranked = relaxed
+                    ranked.setdefault("query", {})["relevance_relaxed"] = True
 
+            if consolidate:
                 ranked["results"] = consolidate_ranked_results(
                     ranked["results"],
                     min_overlap=consolidate_min_overlap,
                 )
+                if direct_query_profile is not None and use_cluster_profile_scoring:
+                    ranked["results"] = rescore_consolidated_results(
+                        ranked["results"],
+                        query_profile=direct_query_profile,
+                        rerank_weight_embed=rerank_weight_embed,
+                        rerank_weight_player=rerank_weight_player,
+                        rerank_weight_pair=rerank_weight_pair,
+                        use_pair_rerank=use_pair_rerank,
+                        recency_weight=recency_weight,
+                    )
+            ranked = self._finalize_ranked_results(ranked, top_n=top_n)
+            if query_tournament_id is not None:
+                ranked_query = ranked.setdefault("query", {})
+                ranked_query["tournament_id"] = query_tournament_id
+                ranked_query["tournament_source"] = query_source
+                ranked_query["tournament_team_name_matches"] = sendou_name_matches
+                ranked_query["tournament_player_id_count"] = len(sendou_player_ids_used)
+            ranked.setdefault("query", {})["seed_player_id_count"] = len(
+                explicit_seed_player_ids
+            )
+            ranked.setdefault("query", {})["query_mode"] = normalized_query_mode
+            ranked.setdefault("query", {})["use_pair_rerank"] = bool(use_pair_rerank)
+            ranked.setdefault("query", {})["use_cluster_profile_scoring"] = bool(
+                use_cluster_profile_scoring
+            )
+            ranked.setdefault("query", {}).update(seed_query_metadata)
+            ranked["results"] = strip_internal_result_fields(ranked["results"])
             logger.debug(
                 "team_search schema=%s snapshot_id=%s mode=ann query=%r targets=%s results=%s elapsed_ms=%.1f",
                 self.schema,
@@ -1747,23 +2646,86 @@ class TeamSearchStore:
             )
             return ranked
 
-        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        cache_entry = cache_entry or self._get_cached_snapshot_entry(snapshot_id)
         all_rows = cache_entry.rows
         ranked = self._rank_similar_teams(
             embeddings=all_rows,
             target_team_ids=target_ids,
             cluster_map=cluster_map,
             top_n=top_n,
+            candidate_top_n=consolidation_candidate_top_n,
             min_relevance=min_relevance,
             cache_entry=cache_entry,
+            recency_weight=recency_weight,
+            query_team_weights=query_team_weights,
+            query_profile=direct_query_profile,
+            rerank_candidate_limit=rerank_candidate_limit,
+            rerank_weight_embed=rerank_weight_embed,
+            rerank_weight_player=rerank_weight_player,
+            rerank_weight_pair=rerank_weight_pair,
+            use_pair_rerank=use_pair_rerank,
         )
-        if consolidate:
-            from team_api.search_logic import consolidate_ranked_results
+        # Adaptive relevance: retry with a relaxed threshold when results
+        # are very sparse so the user doesn't see a confusing empty page.
+        if (
+            len(ranked.get("results", [])) < 3
+            and min_relevance > 0.5
+        ):
+            relaxed = self._rank_similar_teams(
+                embeddings=all_rows,
+                target_team_ids=target_ids,
+                cluster_map=cluster_map,
+                top_n=top_n,
+                candidate_top_n=consolidation_candidate_top_n,
+                min_relevance=max(0.5, min_relevance - 0.2),
+                cache_entry=cache_entry,
+                recency_weight=recency_weight,
+                query_team_weights=query_team_weights,
+                query_profile=direct_query_profile,
+                rerank_candidate_limit=rerank_candidate_limit,
+                rerank_weight_embed=rerank_weight_embed,
+                rerank_weight_player=rerank_weight_player,
+                rerank_weight_pair=rerank_weight_pair,
+                use_pair_rerank=use_pair_rerank,
+            )
+            if len(relaxed.get("results", [])) > len(
+                ranked.get("results", [])
+            ):
+                ranked = relaxed
+                ranked.setdefault("query", {})["relevance_relaxed"] = True
 
+        if consolidate:
             ranked["results"] = consolidate_ranked_results(
                 ranked["results"],
                 min_overlap=consolidate_min_overlap,
             )
+            if direct_query_profile is not None and use_cluster_profile_scoring:
+                ranked["results"] = rescore_consolidated_results(
+                    ranked["results"],
+                    query_profile=direct_query_profile,
+                    rerank_weight_embed=rerank_weight_embed,
+                    rerank_weight_player=rerank_weight_player,
+                    rerank_weight_pair=rerank_weight_pair,
+                    use_pair_rerank=use_pair_rerank,
+                    recency_weight=recency_weight,
+                )
+        ranked = self._finalize_ranked_results(ranked, top_n=top_n)
+        if query_tournament_id is not None:
+            ranked_query = ranked.setdefault("query", {})
+            ranked_query["tournament_id"] = query_tournament_id
+            ranked_query["tournament_source"] = query_source
+            ranked_query["tournament_team_name_matches"] = sendou_name_matches
+            ranked_query["tournament_player_id_count"] = len(sendou_player_ids_used)
+        ranked.setdefault("query", {})["seed_player_id_count"] = len(
+            explicit_seed_player_ids
+        )
+        ranked.setdefault("query", {})["query_mode"] = normalized_query_mode
+        ranked.setdefault("query", {})["use_pair_rerank"] = bool(use_pair_rerank)
+        ranked.setdefault("query", {})["use_cluster_profile_scoring"] = bool(
+            use_cluster_profile_scoring
+        )
+        ranked.setdefault("query", {}).update(seed_query_metadata)
+        ranked["results"] = strip_internal_result_fields(ranked["results"])
         logger.debug(
             "team_search schema=%s snapshot_id=%s mode=cache query=%r targets=%s results=%s elapsed_ms=%.1f",
             self.schema,
@@ -1839,6 +2801,54 @@ class TeamSearchStore:
         )
         return [dict(row) for row in rows]
 
+    def _fetch_snapshot_embedding_config(self, snapshot_id: int) -> Dict[str, Any]:
+        sql_with_cap = f"""
+            SELECT
+                semantic_dim,
+                identity_dim,
+                identity_beta,
+                identity_idf_cap
+            FROM {self.schema}.team_search_refresh_runs
+            WHERE run_id = :snapshot_id
+            LIMIT 1
+        """
+        sql_without_cap = f"""
+            SELECT
+                semantic_dim,
+                identity_dim,
+                identity_beta
+            FROM {self.schema}.team_search_refresh_runs
+            WHERE run_id = :snapshot_id
+            LIMIT 1
+        """
+        with self.engine.connect() as conn:
+            try:
+                row = conn.execute(
+                    text(sql_with_cap),
+                    {"snapshot_id": int(snapshot_id)},
+                ).mappings().first()
+            except SQLAlchemyError as exc:
+                if _is_missing_relation_error(exc):
+                    return {}
+                if not _is_missing_column_error(exc):
+                    raise
+                try:
+                    row = conn.execute(
+                        text(sql_without_cap),
+                        {"snapshot_id": int(snapshot_id)},
+                    ).mappings().first()
+                except SQLAlchemyError as fallback_exc:
+                    if _is_missing_relation_error(fallback_exc):
+                        return {}
+                    raise
+
+        if not row:
+            return {}
+
+        payload = dict(row)
+        payload.setdefault("identity_idf_cap", 3.0)
+        return payload
+
     def _row_to_embedding(self, row: Dict[str, Any]) -> EmbeddingRow:
         def _coerce_vector(value: Any) -> np.ndarray:
             try:
@@ -1852,6 +2862,82 @@ class TeamSearchStore:
                 return int(value)
             except (TypeError, ValueError):
                 return None
+
+        def _coerce_support_map(value: Any) -> Dict[int, float]:
+            if isinstance(value, str):
+                raw = value.strip()
+                if not raw:
+                    return {}
+                try:
+                    value = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {}
+            if not isinstance(value, dict):
+                return {}
+
+            out: Dict[int, float] = {}
+            for raw_key, raw_value in value.items():
+                try:
+                    player_id = int(raw_key)
+                    support = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if player_id <= 0 or support <= 0.0:
+                    continue
+                out[int(player_id)] = float(support)
+            return out
+
+        def _coerce_pair_support_map(value: Any) -> Dict[tuple[int, int], float]:
+            if isinstance(value, str):
+                raw = value.strip()
+                if not raw:
+                    return {}
+                try:
+                    value = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {}
+            if not isinstance(value, dict):
+                return {}
+
+            out: Dict[tuple[int, int], float] = {}
+            for raw_key, raw_value in value.items():
+                parsed = parse_pair_key(raw_key)
+                if parsed is None:
+                    continue
+                try:
+                    support = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if support <= 0.0:
+                    continue
+                out[parsed] = float(support)
+            return out
+
+        def _coerce_lineup_variant_counts(value: Any) -> Dict[tuple[int, ...], int]:
+            if isinstance(value, str):
+                raw = value.strip()
+                if not raw:
+                    return {}
+                try:
+                    value = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {}
+            if not isinstance(value, dict):
+                return {}
+
+            out: Dict[tuple[int, ...], int] = {}
+            for raw_key, raw_value in value.items():
+                parsed = parse_lineup_key(raw_key)
+                if parsed is None:
+                    continue
+                try:
+                    count = int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if count <= 0:
+                    continue
+                out[parsed] = int(count)
+            return out
 
         return EmbeddingRow(
             team_id=int(row["team_id"]),
@@ -1887,9 +2973,57 @@ class TeamSearchStore:
                 for player_name in (row.get("top_lineup_player_names") or [])
                 if player_name is not None
             ),
+            roster_player_ids=tuple(
+                pid
+                for raw_id in (row.get("roster_player_ids") or [])
+                if (pid := _coerce_player_id(raw_id)) is not None
+            ),
+            roster_player_names=tuple(
+                str(player_name)
+                for player_name in (row.get("roster_player_names") or [])
+                if player_name is not None
+            ),
+            roster_player_match_counts=tuple(
+                int(value)
+                for value in (row.get("roster_player_match_counts") or [])
+                if value is not None
+            ),
+            player_support=_coerce_support_map(row.get("player_support")),
+            pair_support=_coerce_pair_support_map(row.get("pair_support")),
+            lineup_variant_counts=_coerce_lineup_variant_counts(
+                row.get("lineup_variant_counts")
+            ),
         )
 
     def load_embeddings(self, snapshot_id: int) -> List[EmbeddingRow]:
+        sql_with_roster = f"""
+            SELECT
+                team_id,
+                tournament_id,
+                team_name,
+                event_time_ms,
+                lineup_count,
+                tournament_count,
+                unique_player_count,
+                distinct_lineup_count,
+                top_lineup_share,
+                lineup_entropy,
+                effective_lineups,
+                semantic_vector,
+                identity_vector,
+                final_vector,
+                top_lineup_summary,
+                top_lineup_player_ids,
+                top_lineup_player_names,
+                roster_player_ids,
+                roster_player_names,
+                roster_player_match_counts,
+                player_support,
+                pair_support,
+                lineup_variant_counts
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+        """
         sql_with_players = f"""
             SELECT
                 team_id,
@@ -1948,7 +3082,7 @@ class TeamSearchStore:
         with self.engine.connect() as conn:
             try:
                 rows = conn.execute(
-                    text(sql_with_players), {"snapshot_id": int(snapshot_id)}
+                    text(sql_with_roster), {"snapshot_id": int(snapshot_id)}
                 ).mappings().all()
             except SQLAlchemyError as exc:
                 if _is_missing_relation_error(exc):
@@ -1962,14 +3096,22 @@ class TeamSearchStore:
                 else:
                     try:
                         rows = conn.execute(
-                            text(sql_legacy), {"snapshot_id": int(snapshot_id)}
+                            text(sql_with_players), {"snapshot_id": int(snapshot_id)}
                         ).mappings().all()
                     except SQLAlchemyError as nested_exc:
                         if not _is_missing_column_error(nested_exc):
                             raise
-                        rows = conn.execute(
-                            text(sql_core), {"snapshot_id": int(snapshot_id)}
-                        ).mappings().all()
+                        try:
+                            rows = conn.execute(
+                                text(sql_legacy),
+                                {"snapshot_id": int(snapshot_id)},
+                            ).mappings().all()
+                        except SQLAlchemyError as legacy_exc:
+                            if not _is_missing_column_error(legacy_exc):
+                                raise
+                            rows = conn.execute(
+                                text(sql_core), {"snapshot_id": int(snapshot_id)}
+                            ).mappings().all()
         normalized_rows = []
         expected_final = None
         expected_semantic = None
@@ -1980,6 +3122,12 @@ class TeamSearchStore:
         for r in row_dicts:
             r.setdefault("top_lineup_player_ids", [])
             r.setdefault("top_lineup_player_names", [])
+            r.setdefault("roster_player_ids", [])
+            r.setdefault("roster_player_names", [])
+            r.setdefault("roster_player_match_counts", [])
+            r.setdefault("player_support", {})
+            r.setdefault("pair_support", {})
+            r.setdefault("lineup_variant_counts", {})
             r_obj = self._row_to_embedding(r)
             final_dim = int(r_obj.final_vector.size)
             semantic_dim = int(r_obj.semantic_vector.size)
@@ -2006,6 +3154,7 @@ class TeamSearchStore:
     def _build_snapshot_cache_entry(
         self, snapshot_id: int, rows: List[EmbeddingRow]
     ) -> EmbeddingSnapshotCacheEntry:
+        config = self._fetch_snapshot_embedding_config(snapshot_id)
         if rows:
             finals = np.stack([row.final_vector for row in rows], axis=0)
             semantics = np.stack([row.semantic_vector for row in rows], axis=0)
@@ -2013,11 +3162,25 @@ class TeamSearchStore:
             lineup_counts = np.asarray(
                 [row.lineup_count for row in rows], dtype=np.float64
             )
+            semantic_dim = int(config.get("semantic_dim") or rows[0].semantic_vector.size)
+            identity_dim = int(config.get("identity_dim") or rows[0].identity_vector.size)
         else:
             finals = np.empty((0, 0), dtype=np.float64)
             semantics = np.empty((0, 0), dtype=np.float64)
             identities = np.empty((0, 0), dtype=np.float64)
             lineup_counts = np.empty((0,), dtype=np.float64)
+            semantic_dim = int(config.get("semantic_dim") or 0)
+            identity_dim = int(config.get("identity_dim") or 0)
+
+        identity_beta = float(config.get("identity_beta") or 3.0)
+        identity_idf_cap = float(config.get("identity_idf_cap") or 3.0)
+        idf_lookup = build_identity_idf_lookup(
+            (
+                row.roster_player_ids or row.top_lineup_player_ids
+                for row in rows
+            ),
+            idf_cap=identity_idf_cap,
+        )
 
         return EmbeddingSnapshotCacheEntry(
             snapshot_id=int(snapshot_id),
@@ -2027,8 +3190,30 @@ class TeamSearchStore:
             identities=identities,
             lineup_counts=lineup_counts,
             index_by_team_id={int(row.team_id): idx for idx, row in enumerate(rows)},
+            team_ids_by_player_id={
+                int(player_id): tuple(team_ids)
+                for player_id, team_ids in self._build_player_team_index(rows).items()
+            },
+            idf_lookup=idf_lookup,
+            semantic_dim=semantic_dim,
+            identity_dim=identity_dim,
+            identity_beta=identity_beta,
+            identity_idf_cap=identity_idf_cap,
             built_at_ms=int(time.time() * 1000),
         )
+
+    @staticmethod
+    def _build_player_team_index(rows: Sequence[EmbeddingRow]) -> Dict[int, List[int]]:
+        out: Dict[int, List[int]] = {}
+        for row in rows:
+            player_ids = _normalize_id_sequence(
+                row.roster_player_ids or row.top_lineup_player_ids
+            )
+            if not player_ids:
+                continue
+            for player_id in player_ids:
+                out.setdefault(int(player_id), []).append(int(row.team_id))
+        return out
 
     def _invalidate_snapshot_cache(self, snapshot_id: Optional[int] = None) -> None:
         with self._cache_lock:
@@ -2116,8 +3301,531 @@ class TeamSearchStore:
             self._cluster_map_cache[key] = cluster_map
         return cluster_map
 
+    def _fetch_sendou_tournament_teams(
+        self, tournament_id: int
+    ) -> List[Dict[str, Any]]:
+        tournament_id = int(tournament_id)
+        url = f"https://sendou.ink/to/{tournament_id}/teams.data"
+        request = urlrequest.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "SplatTopTeams/0.1",
+            },
+        )
+
+        start = time.perf_counter()
+        try:
+            with urlrequest.urlopen(request, timeout=10) as response:
+                raw_payload = response.read()
+            payload = json.loads(raw_payload.decode("utf-8"))
+        except (
+            urlerror.HTTPError,
+            urlerror.URLError,
+            TimeoutError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "sendou_tournament_fetch_failed tournament_id=%s error=%s",
+                tournament_id,
+                exc,
+            )
+            return []
+
+        teams = _extract_sendou_teams_from_turbo_payload(payload)
+        logger.debug(
+            "sendou_tournament_fetch tournament_id=%s teams=%s elapsed_ms=%.1f",
+            tournament_id,
+            len(teams),
+            (time.perf_counter() - start) * 1000.0,
+        )
+        return teams
+
+    def _get_cached_sendou_tournament_teams(
+        self, tournament_id: int
+    ) -> List[Dict[str, Any]]:
+        tid = int(tournament_id)
+        with self._cache_lock:
+            cached = self._sendou_tournament_team_cache.get(tid)
+            if cached is not None:
+                return list(cached)
+
+        teams = self._fetch_sendou_tournament_teams(tid)
+        with self._cache_lock:
+            self._sendou_tournament_team_cache[tid] = list(teams)
+        return list(teams)
+
+    def _match_sendou_tournament_teams(
+        self, tournament_id: int, query: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        normalized_query = _normalize_query(query)
+        token_query = set(_tokenized_query(query))
+        rows = self._get_cached_sendou_tournament_teams(tournament_id)
+        if not rows:
+            return []
+
+        seen: set[str] = set()
+        matches: List[Dict[str, Any]] = []
+        for row in rows:
+            if not _sendou_team_matches_query(
+                row,
+                normalized_query=normalized_query,
+                token_query=token_query,
+            ):
+                continue
+
+            dedupe_key = (
+                str(row.get("team_name") or "").strip().lower()
+                or str(row.get("display_name") or "").strip().lower()
+                or f"id:{row.get('team_id')}"
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            matches.append(dict(row))
+            if len(matches) >= max(1, int(limit)):
+                break
+
+        return matches
+
+    def _match_targets_by_player_ids(
+        self,
+        snapshot_id: int,
+        player_ids: Sequence[int],
+        *,
+        limit: int = 240,
+    ) -> List[int]:
+        normalized_player_ids = _normalize_id_sequence(player_ids)
+        if not normalized_player_ids:
+            return []
+
+        sql_with_roster = f"""
+            SELECT
+                e.team_id,
+                COUNT(*)::int AS overlap_count,
+                MAX(e.lineup_count)::int AS lineup_count
+            FROM {self.schema}.team_search_embeddings e
+            JOIN LATERAL unnest(e.roster_player_ids) AS p(player_id) ON TRUE
+            WHERE e.snapshot_id = :snapshot_id
+              AND p.player_id IN :player_ids
+            GROUP BY e.team_id
+            ORDER BY overlap_count DESC, lineup_count DESC, e.team_id ASC
+            LIMIT :limit
+        """
+        sql_with_top_lineup = f"""
+            SELECT
+                e.team_id,
+                COUNT(*)::int AS overlap_count,
+                MAX(e.lineup_count)::int AS lineup_count
+            FROM {self.schema}.team_search_embeddings e
+            JOIN LATERAL unnest(e.top_lineup_player_ids) AS p(player_id) ON TRUE
+            WHERE e.snapshot_id = :snapshot_id
+              AND p.player_id IN :player_ids
+            GROUP BY e.team_id
+            ORDER BY overlap_count DESC, lineup_count DESC, e.team_id ASC
+            LIMIT :limit
+        """
+        params = {
+            "snapshot_id": int(snapshot_id),
+            "player_ids": normalized_player_ids,
+            "limit": max(1, min(int(limit), 2000)),
+        }
+        try:
+            with self.engine.connect() as conn:
+                try:
+                    rows = conn.execute(
+                        text(sql_with_roster).bindparams(
+                            bindparam("player_ids", expanding=True)
+                        ),
+                        params,
+                    ).mappings().all()
+                except SQLAlchemyError as exc:
+                    if _is_missing_relation_error(exc):
+                        return []
+                    if not _is_missing_column_error(exc):
+                        raise
+                    rows = conn.execute(
+                        text(sql_with_top_lineup).bindparams(
+                            bindparam("player_ids", expanding=True)
+                        ),
+                        params,
+                    ).mappings().all()
+        except SQLAlchemyError as exc:
+            if _is_missing_relation_error(exc) or _is_missing_column_error(exc):
+                return []
+            raise
+
+        return [int(row["team_id"]) for row in rows]
+
+    def list_tournament_teams(
+        self,
+        snapshot_id: int,
+        tournament_id: int,
+        query: Optional[str],
+        limit: int,
+    ) -> Dict[str, Any]:
+        sid = int(snapshot_id)
+        tid = int(tournament_id)
+        max_limit = max(1, min(int(limit), 700))
+
+        normalized_query = _normalize_query(query or "")
+        params: Dict[str, Any] = {
+            "snapshot_id": sid,
+            "tournament_id": tid,
+            "limit": max_limit,
+        }
+        extra_where = ""
+        if normalized_query:
+            params["name_like"] = f"%{str(query or '').strip().lower()}%"
+            params["name_norm"] = normalized_query
+            extra_where = """
+              AND (
+                LOWER(COALESCE(team_name, '')) LIKE :name_like
+                OR regexp_replace(LOWER(COALESCE(team_name, '')), '[^a-z0-9]+', '', 'g') = :name_norm
+              )
+            """
+
+        sql = f"""
+            SELECT
+                team_id,
+                team_name,
+                lineup_count,
+                event_time_ms
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+              AND tournament_id = :tournament_id
+              {extra_where}
+            ORDER BY lineup_count DESC, team_name ASC, team_id ASC
+            LIMIT :limit
+        """
+        local_rows = self._fetch_rows(sql, params, missing_default=[])
+        if local_rows:
+            teams = [
+                {
+                    "team_id": int(row["team_id"]),
+                    "team_name": str(row.get("team_name") or row["team_id"]),
+                    "display_name": str(row.get("team_name") or row["team_id"]),
+                    "lineup_count": int(row.get("lineup_count") or 0),
+                    "event_time_ms": (
+                        int(row["event_time_ms"])
+                        if row.get("event_time_ms") is not None
+                        else None
+                    ),
+                    "member_user_ids": [],
+                    "member_names": [],
+                    "source": "dataset",
+                }
+                for row in local_rows
+            ]
+            return {
+                "tournament_id": tid,
+                "source": "dataset",
+                "teams": teams,
+            }
+
+        remote_rows = self._get_cached_sendou_tournament_teams(tid)
+        if normalized_query:
+            token_query = set(_tokenized_query(query or ""))
+            filtered_rows: List[Dict[str, Any]] = []
+            for row in remote_rows:
+                if _sendou_team_matches_query(
+                    row,
+                    normalized_query=normalized_query,
+                    token_query=token_query,
+                ):
+                    filtered_rows.append(row)
+            remote_rows = filtered_rows
+
+        teams = []
+        for row in remote_rows[:max_limit]:
+            team_id = row.get("team_id")
+            teams.append(
+                {
+                    "team_id": int(team_id) if isinstance(team_id, (int, float)) else None,
+                    "team_name": str(row.get("team_name") or ""),
+                    "display_name": str(row.get("display_name") or row.get("team_name") or ""),
+                    "lineup_count": 0,
+                    "event_time_ms": None,
+                    "member_user_ids": _normalize_id_sequence(row.get("member_user_ids") or []),
+                    "member_names": [
+                        str(name).strip()
+                        for name in (row.get("member_names") or [])
+                        if str(name or "").strip()
+                    ],
+                    "source": "sendou",
+                }
+            )
+
+        return {
+            "tournament_id": tid,
+            "source": "sendou" if teams else "none",
+            "teams": teams,
+        }
+
+    def suggest_players(
+        self,
+        snapshot_id: int,
+        query: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        limit = max(1, min(limit, 50))
+        sid = int(snapshot_id)
+
+        prefix_sql = f"""
+            SELECT
+                p.player_id,
+                p.display_name,
+                COUNT(DISTINCT e.team_id)::int AS team_count
+            FROM {self.schema}.players p
+            JOIN {self.schema}.team_search_embeddings e
+                ON e.snapshot_id = :snapshot_id
+            JOIN LATERAL unnest(e.roster_player_ids) AS rp(pid) ON TRUE
+            WHERE rp.pid = p.player_id
+              AND LOWER(p.display_name) LIKE :prefix
+            GROUP BY p.player_id, p.display_name
+            ORDER BY team_count DESC, p.display_name ASC
+            LIMIT :limit
+        """
+        params: Dict[str, Any] = {
+            "snapshot_id": sid,
+            "prefix": f"{q}%",
+            "limit": limit,
+        }
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(prefix_sql), params).mappings().all()
+        except SQLAlchemyError:
+            rows = []
+
+        suggestions = [
+            {
+                "player_id": int(r["player_id"]),
+                "display_name": str(r["display_name"]),
+                "team_count": int(r["team_count"]),
+            }
+            for r in rows
+        ]
+
+        if len(suggestions) >= limit:
+            return suggestions[:limit]
+
+        remaining = limit - len(suggestions)
+        seen_ids = {s["player_id"] for s in suggestions}
+
+        if self._detect_trgm_support() and len(q) >= 2:
+            trgm_sql = f"""
+                SELECT
+                    p.player_id,
+                    p.display_name,
+                    COUNT(DISTINCT e.team_id)::int AS team_count,
+                    similarity(LOWER(p.display_name), :q) AS sim
+                FROM {self.schema}.players p
+                JOIN {self.schema}.team_search_embeddings e
+                    ON e.snapshot_id = :snapshot_id
+                JOIN LATERAL unnest(e.roster_player_ids) AS rp(pid) ON TRUE
+                WHERE rp.pid = p.player_id
+                  AND LOWER(p.display_name) %% :q
+                GROUP BY p.player_id, p.display_name
+                ORDER BY sim DESC, team_count DESC
+                LIMIT :fetch_limit
+            """
+            trgm_params = {
+                "snapshot_id": sid,
+                "q": q,
+                "fetch_limit": remaining + 5,
+            }
+            try:
+                with self.engine.connect() as conn:
+                    trgm_rows = conn.execute(
+                        text(trgm_sql), trgm_params
+                    ).mappings().all()
+                for r in trgm_rows:
+                    pid = int(r["player_id"])
+                    if pid not in seen_ids:
+                        suggestions.append(
+                            {
+                                "player_id": pid,
+                                "display_name": str(r["display_name"]),
+                                "team_count": int(r["team_count"]),
+                            }
+                        )
+                        seen_ids.add(pid)
+                    if len(suggestions) >= limit:
+                        break
+            except SQLAlchemyError:
+                pass
+
+        return suggestions[:limit]
+
+    def get_player_teams(
+        self,
+        snapshot_id: int,
+        player_id: int,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        sid = int(snapshot_id)
+        pid = int(player_id)
+        limit = max(1, min(limit, 200))
+
+        names = self._fetch_player_names([pid])
+        display_name = names.get(pid, str(pid))
+
+        sql = f"""
+            SELECT
+                e.team_id,
+                e.team_name,
+                e.lineup_count,
+                e.event_time_ms,
+                e.roster_player_ids,
+                e.roster_player_names,
+                e.roster_player_match_counts
+            FROM {self.schema}.team_search_embeddings e
+            JOIN LATERAL unnest(e.roster_player_ids) AS rp(pid) ON TRUE
+            WHERE e.snapshot_id = :snapshot_id
+              AND rp.pid = :player_id
+            ORDER BY e.lineup_count DESC, e.team_id ASC
+            LIMIT :limit
+        """
+        params = {"snapshot_id": sid, "player_id": pid, "limit": limit}
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(sql), params).mappings().all()
+        except SQLAlchemyError:
+            rows = []
+
+        teams: List[Dict[str, Any]] = []
+        for r in rows:
+            roster_ids = tuple(
+                rid
+                for raw_id in (r.get("roster_player_ids") or [])
+                if (rid := _coerce_player_id(raw_id)) is not None
+            )
+            roster_names = tuple(
+                str(n) for n in (r.get("roster_player_names") or []) if n is not None
+            )
+            match_counts = tuple(
+                int(v) for v in (r.get("roster_player_match_counts") or []) if v is not None
+            )
+
+            player_match_count = 0
+            for idx, rid in enumerate(roster_ids):
+                if rid == pid:
+                    player_match_count = match_counts[idx] if idx < len(match_counts) else 0
+                    break
+
+            teams.append(
+                {
+                    "team_id": int(r["team_id"]),
+                    "team_name": str(r["team_name"] or ""),
+                    "lineup_count": int(r["lineup_count"]),
+                    "event_time_ms": int(r["event_time_ms"] or 0),
+                    "player_match_count": player_match_count,
+                    "roster_player_names": list(roster_names),
+                }
+            )
+
+        return {
+            "player_id": pid,
+            "display_name": display_name,
+            "team_count": len(teams),
+            "teams": teams,
+        }
+
+    def suggest_team_names(
+        self,
+        snapshot_id: int,
+        query: str,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        limit = max(1, min(limit, 25))
+
+        prefix_sql = f"""
+            SELECT DISTINCT ON (LOWER(team_name))
+                team_id, team_name, lineup_count
+            FROM {self.schema}.team_search_embeddings
+            WHERE snapshot_id = :snapshot_id
+              AND LOWER(team_name) LIKE :prefix
+            ORDER BY LOWER(team_name), lineup_count DESC
+            LIMIT :limit
+        """
+        params = {
+            "snapshot_id": int(snapshot_id),
+            "prefix": f"{q}%",
+            "limit": limit,
+        }
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(prefix_sql), params).mappings().all()
+        except SQLAlchemyError:
+            rows = []
+
+        suggestions = [
+            {
+                "team_id": int(r["team_id"]),
+                "team_name": r["team_name"],
+                "lineup_count": int(r["lineup_count"]),
+            }
+            for r in rows
+        ]
+
+        if len(suggestions) >= limit:
+            return suggestions[:limit]
+
+        remaining = limit - len(suggestions)
+        seen_names = {s["team_name"].lower() for s in suggestions}
+
+        if self._detect_trgm_support() and len(q) >= 2:
+            trgm_sql = f"""
+                SELECT DISTINCT ON (LOWER(team_name))
+                    team_id, team_name, lineup_count,
+                    similarity(LOWER(COALESCE(team_name, '')), :q) AS sim
+                FROM {self.schema}.team_search_embeddings
+                WHERE snapshot_id = :snapshot_id
+                  AND LOWER(COALESCE(team_name, '')) %% :q
+                ORDER BY LOWER(team_name), lineup_count DESC
+                LIMIT :fetch_limit
+            """
+            trgm_params = {
+                "snapshot_id": int(snapshot_id),
+                "q": q,
+                "fetch_limit": remaining + 5,
+            }
+            try:
+                with self.engine.connect() as conn:
+                    trgm_rows = conn.execute(
+                        text(trgm_sql), trgm_params
+                    ).mappings().all()
+                for r in trgm_rows:
+                    if r["team_name"].lower() not in seen_names:
+                        suggestions.append(
+                            {
+                                "team_id": int(r["team_id"]),
+                                "team_name": r["team_name"],
+                                "lineup_count": int(r["lineup_count"]),
+                            }
+                        )
+                        seen_names.add(r["team_name"].lower())
+                    if len(suggestions) >= limit:
+                        break
+            except SQLAlchemyError:
+                pass
+
+        return suggestions[:limit]
+
     def match_targets(
-        self, snapshot_id: int, query: str, limit: int = 25
+        self,
+        snapshot_id: int,
+        query: str,
+        limit: int = 25,
+        tournament_id: Optional[int] = None,
     ) -> List[int]:
         limit = max(1, min(limit, 200))
         q = (query or "").strip().lower()
@@ -2125,12 +3833,18 @@ class TeamSearchStore:
             return []
 
         normalized_q = _normalize_query(q)
+        tournament_filter = ""
+        tournament_params: Dict[str, Any] = {}
+        if tournament_id is not None:
+            tournament_filter = "AND tournament_id = :tournament_id"
+            tournament_params["tournament_id"] = int(tournament_id)
 
         params = {
             "snapshot_id": int(snapshot_id),
             "name_like": f"%{q}%",
             "name_eq": q,
             "limit": limit,
+            **tournament_params,
         }
         where_clause = (
             "LOWER(team_name) = :name_eq "
@@ -2153,6 +3867,7 @@ class TeamSearchStore:
             SELECT team_id
             FROM {self.schema}.team_search_embeddings
             WHERE snapshot_id = :snapshot_id
+              {tournament_filter}
               AND ({where_clause})
             ORDER BY
                 CASE
@@ -2173,11 +3888,39 @@ class TeamSearchStore:
                 raise
         target_ids = [int(row[0]) for row in rows]
 
-        # Fallback path catches edge cases where normalized names are too noisy for SQL
-        # matching (for example special characters or inconsistent storage values).
         if target_ids:
             return target_ids
 
+        # Trigram fuzzy matching (catches typos like "Moonlgiht" → "Moonlight").
+        if self._detect_trgm_support() and len(q) >= 2:
+            trgm_sql = f"""
+                SELECT team_id,
+                       similarity(LOWER(COALESCE(team_name, '')), :query_lower) AS sim
+                FROM {self.schema}.team_search_embeddings
+                WHERE snapshot_id = :snapshot_id
+                  {tournament_filter}
+                  AND LOWER(COALESCE(team_name, '')) %% :query_lower
+                ORDER BY sim DESC, lineup_count DESC
+                LIMIT :limit
+            """
+            trgm_params = {
+                "snapshot_id": int(snapshot_id),
+                "query_lower": q,
+                "limit": limit,
+                **tournament_params,
+            }
+            try:
+                with self.engine.connect() as conn:
+                    trgm_rows = conn.execute(
+                        text(trgm_sql), trgm_params
+                    ).fetchall()
+                trgm_ids = [int(row[0]) for row in trgm_rows]
+                if trgm_ids:
+                    return trgm_ids
+            except SQLAlchemyError:
+                pass
+
+        # Last-resort fallback: scan top teams by lineup_count in Python.
         with self.engine.connect() as conn:
             try:
                 fallback_rows = conn.execute(
@@ -2186,11 +3929,16 @@ class TeamSearchStore:
                         SELECT team_id, team_name
                         FROM {self.schema}.team_search_embeddings
                         WHERE snapshot_id = :snapshot_id
+                          {tournament_filter}
                         ORDER BY lineup_count DESC
                         LIMIT :fallback_limit
                     """
                     ),
-                    {"snapshot_id": int(snapshot_id), "fallback_limit": limit * 10},
+                    {
+                        "snapshot_id": int(snapshot_id),
+                        "fallback_limit": limit * 10,
+                        **tournament_params,
+                    },
                 ).mappings().all()
             except SQLAlchemyError as exc:
                 if _is_missing_relation_error(exc) or _is_missing_column_error(exc):

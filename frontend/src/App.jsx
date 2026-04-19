@@ -3,6 +3,7 @@ import AdvancedAnalytics from './components/AdvancedAnalytics';
 import { fetchHealth } from './api';
 import ClusterExplorer from './components/ClusterExplorer';
 import HeadToHead from './components/HeadToHead';
+import PlayerLookup from './components/PlayerLookup';
 import TeamSearch from './components/TeamSearch';
 
 function parseTeamIds(value) {
@@ -105,6 +106,14 @@ export default function App() {
             </button>
             <button
               role="tab"
+              aria-selected={tab === 'players'}
+              className={`tab ${tab === 'players' ? 'is-active' : ''}`}
+              onClick={() => setTab('players')}
+            >
+              Player Lookup
+            </button>
+            <button
+              role="tab"
               aria-selected={tab === 'head-to-head'}
               className={`tab ${tab === 'head-to-head' ? 'is-active' : ''}`}
               onClick={() => setTab('head-to-head')}
@@ -153,6 +162,13 @@ export default function App() {
             onOpenHeadToHead={(role, teamId, snapshotId) => {
               pickHeadToHeadTeam(role, teamId, snapshotId);
               setTab('head-to-head');
+            }}
+          />
+        ) : null}
+        {tab === 'players' ? (
+          <PlayerLookup
+            onOpenTeamSearch={(teamName) => {
+              setTab('search');
             }}
           />
         ) : null}

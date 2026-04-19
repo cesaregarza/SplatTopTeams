@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { fetchTeamSearch } from '../api';
+import { fetchTeamSearch, fetchTeamSuggestions, fetchTournamentTeams } from '../api';
 
 function fmtDate(ms) {
   const value = toEpochMs(ms);
@@ -224,33 +224,34 @@ function pluralizeCount(value, singular) {
   return `${parsed} ${singular}${parsed === 1 ? '' : 's'}`;
 }
 
-const CONSOLIDATED_BUCKETS = [
-  { label: '1', min: 1, max: 1 },
-  { label: '2–3', min: 2, max: 3 },
-  { label: '4–7', min: 4, max: 7 },
-  { label: '8–15', min: 8, max: 15 },
-  { label: '16–30', min: 16, max: 30 },
-  { label: '31–60', min: 31, max: 60 },
-  { label: '61–100', min: 61, max: 100 },
-  { label: '101+', min: 101, max: Number.POSITIVE_INFINITY },
-];
+function tournamentTeamDisplayName(team) {
+  const display = String(team?.display_name || '').trim();
+  if (display) return display;
 
-function buildConsolidatedBuckets(values) {
-  const counts = CONSOLIDATED_BUCKETS.map(() => 0);
+  const name = String(team?.team_name || '').trim();
+  if (name) return name;
 
-  for (const value of values) {
-    const parsed = safeInt(value);
-    if (!Number.isFinite(parsed) || parsed < 1) continue;
+  const parsedId = safeIntOrNull(team?.team_id);
+  if (parsedId && parsedId > 0) return `Team ${parsedId}`;
+  return 'Untitled team';
+}
 
-    const bucketIndex = CONSOLIDATED_BUCKETS.findIndex((bucket) => parsed >= bucket.min && parsed <= bucket.max);
-    if (bucketIndex === -1) continue;
-    counts[bucketIndex] += 1;
+function tournamentTeamMeta(team) {
+  const members = Array.isArray(team?.member_names)
+    ? team.member_names
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    : [];
+  const id = safeIntOrNull(team?.team_id);
+  const pieces = [];
+  if (id && id > 0) {
+    pieces.push(`ID ${id}`);
   }
-
-  return CONSOLIDATED_BUCKETS.map((bucket, index) => ({
-    label: bucket.label,
-    count: counts[index],
-  }));
+  if (members.length > 0) {
+    const preview = members.slice(0, 3).join(', ');
+    pieces.push(members.length > 3 ? `${preview} +${members.length - 3}` : preview);
+  }
+  return pieces.join(' · ');
 }
 
 export default function TeamSearch({
@@ -266,12 +267,25 @@ export default function TeamSearch({
   const [minRelevance, setMinRelevance] = useState(0.8);
   const [consolidate, setConsolidate] = useState(true);
   const [consolidateMinOverlap, setConsolidateMinOverlap] = useState(0.8);
+  const [recencyWeight, setRecencyWeight] = useState(0);
+  const [tournamentId, setTournamentId] = useState('');
+  const [tournamentTeamLookup, setTournamentTeamLookup] = useState('');
+  const [selectedTournamentSeedMeta, setSelectedTournamentSeedMeta] = useState(null);
+  const [selectedTournamentSeedPlayerIds, setSelectedTournamentSeedPlayerIds] = useState([]);
+  const [tournamentTeams, setTournamentTeams] = useState([]);
+  const [tournamentTeamsSource, setTournamentTeamsSource] = useState('none');
+  const [tournamentTeamsLoading, setTournamentTeamsLoading] = useState(false);
+  const [tournamentTeamsError, setTournamentTeamsError] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [payload, setPayload] = useState(null);
   const [expandedCards, setExpandedCards] = useState(() => new Set());
   const [expandedPlayers, setExpandedPlayers] = useState(() => new Set());
   const [expandedAliases, setExpandedAliases] = useState(() => new Set());
+  const [sortBy, setSortBy] = useState('relevance');
+  const [visibleCount, setVisibleCount] = useState(20);
+  const [suggestions, setSuggestions] = useState([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
 
   const resultLabel = useMemo(() => {
     if (!payload) return 'No query yet.';
@@ -281,10 +295,33 @@ export default function TeamSearch({
       (acc, row) => acc + (Number(row.consolidated_team_count) || 1),
       0,
     );
-    return `${payload.result_count} result groups (${deduped} teams) from snapshot ${payload.snapshot_id} · ${clustered} clustered · ${consolidatedGroups} consolidated (${payload.cluster_mode})`;
+    const tournamentScope = payload?.query_context?.tournament_id
+      ? ` · tournament ${payload.query_context.tournament_id} (${payload?.query_context?.tournament_source || 'dataset'})`
+      : '';
+    const seededPlayers = Number(payload?.query_context?.seed_player_id_count || 0);
+    const seedScope = seededPlayers > 0 ? ` · seeded from ${seededPlayers} player ID${seededPlayers === 1 ? '' : 's'}` : '';
+    return `${payload.result_count} result groups (${deduped} teams) from snapshot ${payload.snapshot_id}${tournamentScope}${seedScope} · ${clustered} clustered · ${consolidatedGroups} consolidated (${payload.cluster_mode})`;
   }, [payload]);
 
-  const results = useMemo(() => payload?.results || [], [payload]);
+  const results = useMemo(() => {
+    const raw = payload?.results || [];
+    if (sortBy === 'relevance' || !raw.length) return raw;
+    const sorted = [...raw];
+    if (sortBy === 'matches') {
+      sorted.sort(
+        (a, b) =>
+          safeInt(b.match_count ?? b.lineup_count) -
+          safeInt(a.match_count ?? a.lineup_count),
+      );
+    } else if (sortBy === 'recency') {
+      sorted.sort(
+        (a, b) =>
+          (toEpochMs(b.event_time_ms) ?? 0) -
+          (toEpochMs(a.event_time_ms) ?? 0),
+      );
+    }
+    return sorted;
+  }, [payload, sortBy]);
   const baselineResult = useMemo(() => (results.length > 0 ? results[0] : null), [results]);
   const teamAValue = safeIntOrNull(selectedTeamAId);
   const teamBValue = safeIntOrNull(selectedTeamBId);
@@ -296,17 +333,93 @@ export default function TeamSearch({
     const ids = [...selectedTeamBIds, teamBValue].filter((value) => Number.isFinite(value) && value > 0);
     return new Set(ids);
   }, [selectedTeamBIds, teamBValue]);
+  const parsedTournamentId = useMemo(() => {
+    const parsed = Number(tournamentId);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return Math.trunc(parsed);
+  }, [tournamentId]);
 
   useEffect(() => {
-    const nextExpandedCards = new Set();
-    const firstTeamId = results[0]?.team_id;
-    if (firstTeamId !== undefined && firstTeamId !== null) {
-      nextExpandedCards.add(String(firstTeamId));
-    }
-    setExpandedCards(nextExpandedCards);
+    setSelectedTournamentSeedMeta(null);
+    setSelectedTournamentSeedPlayerIds([]);
+    if (parsedTournamentId !== null) return;
+    setTournamentTeamLookup('');
+    setTournamentTeams([]);
+    setTournamentTeamsSource('none');
+    setTournamentTeamsError('');
+    setTournamentTeamsLoading(false);
+  }, [parsedTournamentId]);
+
+  useEffect(() => {
+    if (parsedTournamentId === null) return;
+
+    const requestQuery = tournamentTeamLookup.trim();
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setTournamentTeamsLoading(true);
+      setTournamentTeamsError('');
+      try {
+        const response = await fetchTournamentTeams({
+          tournamentId: parsedTournamentId,
+          q: requestQuery,
+          limit: 700,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        setTournamentTeams(Array.isArray(response?.teams) ? response.teams : []);
+        setTournamentTeamsSource(response?.source || 'none');
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setTournamentTeams([]);
+        setTournamentTeamsSource('none');
+        setTournamentTeamsError(err.message || 'Failed to load tournament teams');
+      } finally {
+        if (!controller.signal.aborted) {
+          setTournamentTeamsLoading(false);
+        }
+      }
+    }, 220);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [parsedTournamentId, tournamentTeamLookup]);
+
+  useEffect(() => {
+    setExpandedCards(new Set());
     setExpandedPlayers(new Set());
     setExpandedAliases(new Set());
+    setVisibleCount(20);
   }, [payload, results]);
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      setSuggestions([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const data = await fetchTeamSuggestions({
+          q: trimmed,
+          limit: 8,
+          signal: controller.signal,
+        });
+        if (!controller.signal.aborted) {
+          setSuggestions(data.suggestions || []);
+          setShowSuggestions(true);
+        }
+      } catch {
+        if (!controller.signal.aborted) setSuggestions([]);
+      }
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [query]);
 
   function toggleCardExpansion(teamId) {
     const key = String(teamId);
@@ -347,6 +460,30 @@ export default function TeamSearch({
     });
   }
 
+  function onSelectTournamentTeam(team) {
+    const normalized = tournamentTeamDisplayName(team);
+    if (!normalized) return;
+    const normalizedTeamId = safeIntOrNull(team?.team_id);
+    const seedIds = Array.isArray(team?.member_user_ids)
+      ? team.member_user_ids
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value) && value > 0)
+          .map((value) => Math.trunc(value))
+      : [];
+    setQuery(normalized);
+    setTournamentTeamLookup(normalized);
+    setSelectedTournamentSeedMeta({
+      teamName: normalized,
+      teamId: Number.isFinite(normalizedTeamId) && normalizedTeamId > 0 ? Math.trunc(normalizedTeamId) : null,
+    });
+    setSelectedTournamentSeedPlayerIds(seedIds);
+  }
+
+  function clearSeedSelection() {
+    setSelectedTournamentSeedMeta(null);
+    setSelectedTournamentSeedPlayerIds([]);
+  }
+
   async function onSubmit(event) {
     event.preventDefault();
     if (!query.trim()) return;
@@ -358,8 +495,11 @@ export default function TeamSearch({
         topN,
         clusterMode,
         minRelevance,
+        tournamentId: parsedTournamentId ?? undefined,
+        seedPlayerIds: selectedTournamentSeedPlayerIds,
         consolidate,
         consolidateMinOverlap,
+        recencyWeight,
       });
       setPayload(data);
     } catch (err) {
@@ -378,15 +518,163 @@ export default function TeamSearch({
 
       <form className="search-form" onSubmit={onSubmit}>
         <label htmlFor="team-query" className="field-label">Team query</label>
-        <input
-          id="team-query"
-          className="input"
-          type="search"
-          placeholder="e.g. FTW, Moonlight, Hypernova"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          required
-        />
+        <div
+          className="search-input-wrap"
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) {
+              setTimeout(() => setShowSuggestions(false), 150);
+            }
+          }}
+        >
+          <input
+            id="team-query"
+            className="input"
+            type="search"
+            placeholder="e.g. FTW, Moonlight, Hypernova"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              clearSeedSelection();
+            }}
+            onFocus={() => {
+              if (suggestions.length) setShowSuggestions(true);
+            }}
+            autoComplete="off"
+            role="combobox"
+            aria-expanded={showSuggestions && suggestions.length > 0}
+            aria-controls="team-suggestions"
+            aria-autocomplete="list"
+            required
+          />
+          {showSuggestions && suggestions.length > 0 ? (
+            <ul id="team-suggestions" className="suggestion-dropdown" role="listbox">
+              {suggestions.map((s) => (
+                <li key={s.team_id} role="option" aria-selected={false}>
+                  <button
+                    type="button"
+                    className="suggestion-option"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setQuery(s.team_name);
+                      setShowSuggestions(false);
+                    }}
+                  >
+                    <span className="suggestion-name">{s.team_name}</span>
+                    <span className="suggestion-meta">{s.lineup_count} matches</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+        {selectedTournamentSeedPlayerIds.length > 0 ? (
+          <div className="seed-affordance" role="status" aria-live="polite">
+            <span className="seed-affordance-label">Embedding seed active</span>
+            <span className="seed-affordance-name">
+              {selectedTournamentSeedMeta?.teamName || 'Tournament team'}
+            </span>
+            <span className="seed-affordance-meta">
+              {selectedTournamentSeedPlayerIds.length} player ID{selectedTournamentSeedPlayerIds.length === 1 ? '' : 's'}
+            </span>
+            <button
+              type="button"
+              className="seed-affordance-clear"
+              onClick={clearSeedSelection}
+            >
+              Clear seed
+            </button>
+          </div>
+        ) : null}
+
+        <div className="row fields-row tournament-row">
+          <div className="field">
+            <label htmlFor="tournament-id" className="field-label">Tournament ID (optional)</label>
+            <input
+              id="tournament-id"
+              className="input"
+              type="number"
+              min={1}
+              step={1}
+              placeholder="e.g. 3192"
+              value={tournamentId}
+              onChange={(e) => setTournamentId(e.target.value)}
+            />
+            <span className="field-label-subtitle">
+              Scope query rows to this tournament. If missing in snapshot, teams are pulled from sendou.ink.
+            </span>
+          </div>
+          <div className="field tournament-picker-field">
+            <label htmlFor="tournament-team-search" className="field-label">Tournament team pull-down</label>
+            <input
+              id="tournament-team-search"
+              className="input"
+              type="search"
+              placeholder={parsedTournamentId === null ? 'Set tournament ID first' : 'Type team or player name'}
+              value={tournamentTeamLookup}
+              onChange={(event) => setTournamentTeamLookup(event.target.value)}
+              disabled={parsedTournamentId === null}
+            />
+            <span className="field-label-subtitle">
+              Search teams inside the tournament and pick one to fill Team query. Supports unnamed teams via player names.
+            </span>
+            {parsedTournamentId !== null ? (
+              <div className="tournament-team-picker" aria-live="polite">
+                <p className="meta">
+                  {tournamentTeamsLoading
+                    ? 'Loading teams…'
+                    : `${tournamentTeams.length} team${tournamentTeams.length === 1 ? '' : 's'} loaded from ${tournamentTeamsSource}.`}
+                </p>
+                {!tournamentTeamsLoading && tournamentTeams.length ? (
+                  <ul className="tournament-team-dropdown" role="listbox" aria-label="Tournament teams">
+                    {tournamentTeams.slice(0, 80).map((team, index) => {
+                      const label = tournamentTeamDisplayName(team);
+                      const optionTeamId = safeIntOrNull(team?.team_id);
+                      const isSelectedTeam = selectedTournamentSeedPlayerIds.length > 0
+                        && (
+                          (
+                            Number.isFinite(optionTeamId)
+                            && optionTeamId > 0
+                            && Number.isFinite(selectedTournamentSeedMeta?.teamId)
+                            && Math.trunc(optionTeamId) === Math.trunc(selectedTournamentSeedMeta.teamId)
+                          )
+                          || (
+                            !Number.isFinite(selectedTournamentSeedMeta?.teamId)
+                            && selectedTournamentSeedMeta?.teamName === label
+                          )
+                        );
+                      const baseMeta = tournamentTeamMeta(team);
+                      const meta = isSelectedTeam
+                        ? `${baseMeta ? `${baseMeta} · ` : ''}seeding active`
+                        : baseMeta;
+                      return (
+                        <li
+                          key={`${team.team_id ?? 'ext'}-${label}-${index}`}
+                          role="option"
+                          aria-selected={isSelectedTeam}
+                        >
+                          <button
+                            type="button"
+                            className={`tournament-team-option ${isSelectedTeam ? 'is-selected' : ''}`}
+                            onClick={() => onSelectTournamentTeam(team)}
+                            title={meta || label}
+                          >
+                            <span className="tournament-team-option-name">{label}</span>
+                            {meta ? <span className="tournament-team-option-meta">{meta}</span> : null}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+                {!tournamentTeamsLoading && !tournamentTeams.length && tournamentTeamLookup.trim() ? (
+                  <p className="meta">No teams matched this search.</p>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        {tournamentTeamsError ? <p className="error">{tournamentTeamsError}</p> : null}
 
         <div className="row fields-row">
           <div className="field">
@@ -481,6 +769,26 @@ export default function TeamSearch({
               <option value="100" label="100%" />
             </datalist>
           </div>
+
+          <div className="field">
+            <label htmlFor="recency-weight" className="field-label slider-label">
+              Recency bias
+            </label>
+            <input
+              id="recency-weight"
+              className="input slider-input"
+              type="range"
+              min={0}
+              max={100}
+              step={10}
+              value={Math.round(recencyWeight * 100)}
+              onChange={(e) => setRecencyWeight(Number(e.target.value) / 100)}
+              aria-describedby="recency-weight-value"
+            />
+            <output id="recency-weight-value" className="slider-output">
+              {Math.round(recencyWeight * 100)}%
+            </output>
+          </div>
         </div>
 
         <button className="button" type="submit" disabled={loading}>
@@ -491,9 +799,37 @@ export default function TeamSearch({
       <p className="status" role="status" aria-live="polite">{resultLabel}</p>
       {error ? <p className="error">{error}</p> : null}
 
+      {payload && results.length === 0 && !loading && !error ? (
+        <div className="empty-state" role="status">
+          <p className="empty-state-title">No teams found for &ldquo;{query}&rdquo;</p>
+          <p className="empty-state-hint">
+            Try a different spelling or a shorter query. You can also search by
+            team ID or player name.
+            {Number(minRelevance) > 0.5
+              ? ' Lowering the minimum relevance slider may reveal more results.'
+              : null}
+          </p>
+        </div>
+      ) : null}
+
+      {results.length > 0 ? (
+        <div className="results-toolbar">
+          <label htmlFor="sort-by" className="field-label">Sort by</label>
+          <select
+            id="sort-by"
+            className="input input-compact"
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+          >
+            <option value="relevance">Relevance</option>
+            <option value="matches">Match count</option>
+            <option value="recency">Most recent</option>
+          </select>
+        </div>
+      ) : null}
 
       <div className="card-grid">
-        {results.map((row, index) => {
+        {results.slice(0, visibleCount).map((row, index) => {
           const rowTeamId = safeInt(row.team_id);
           const teamIdText = String(row.team_id || 'n/a');
           const teamDisplayName = row.team_name || `Team ${teamIdText}`;
@@ -545,21 +881,6 @@ export default function TeamSearch({
           const consolidatedEntriesSorted = consolidatedEntries
             .slice()
             .sort((a, b) => safeInt(b.match_count) - safeInt(a.match_count) || safeInt(b.tournament_count) - safeInt(a.tournament_count));
-          const consolidatedMatchValues = consolidatedEntriesSorted.map((team) => safeInt(team.match_count));
-          const consolidatedMatchRangeMin = consolidatedMatchValues.length ? Math.min(...consolidatedMatchValues) : 0;
-          const consolidatedMatchRangeMax = consolidatedMatchValues.length ? Math.max(...consolidatedMatchValues) : 0;
-          const consolidatedMatchAverage = consolidatedMatchValues.length
-            ? consolidatedMatchValues.reduce((acc, count) => acc + count, 0) / consolidatedMatchValues.length
-            : 0;
-          const consolidatedMatchBuckets = buildConsolidatedBuckets(consolidatedMatchValues);
-          const maxBucketCount = consolidatedMatchBuckets.reduce((acc, bucket) => Math.max(acc, bucket.count), 0);
-          const consolidatedTournamentIds = new Set(
-            consolidatedEntriesSorted
-              .map((entry) => entry.tournament_id)
-              .filter((value) => value !== null && value !== undefined)
-              .map((value) => String(value)),
-          );
-          const consolidatedTournamentsCovered = consolidatedTournamentIds.size || tournamentCount;
           const maxVisibleAliases = 3;
           const aliasesExpanded = expandedAliases.has(teamIdText);
           const visibleAliases = aliasesExpanded
@@ -576,25 +897,10 @@ export default function TeamSearch({
           const topLineupPlayerCount = safeInt(
             row.top_lineup_player_count ?? topLineupPlayers.length,
           );
-          const isClustered = row.cluster_id != null;
-          const clusterSize = row.cluster_size != null ? Number(row.cluster_size) : null;
-          const clusterSizeText = clusterSize == null ? 'n/a' : `${clusterSize} team${clusterSize === 1 ? '' : 's'}`;
-          const clusterIdText = safeInt(row.cluster_id);
           const isConsolidatedProfile = normalizedConsolidatedCount > 1;
-          const clusterLabel = isClustered
-            ? `cluster ${clusterIdText} · size ${clusterSizeText}`
-            : 'unclustered';
-          const clusterTitle = isClustered
-            ? `Team belongs to cluster ${clusterIdText} with ${clusterSizeText} in total`
-            : 'Team was not assigned to a cluster';
           const cardSubtitle = isConsolidatedProfile
-            ? `Consolidated profile (${normalizedConsolidatedCount} teams) — Unclustered seed`
-            : isClustered
-              ? `Cluster ${clusterIdText} (${clusterSizeText}) — Candidate cluster`
-              : 'Unclustered profile (single team) — No cluster assignment';
-          const idLabel = isClustered
-            ? `Cluster member ID: ${teamIdText}`
-            : `Entity ID: ${teamIdText}`;
+            ? `Consolidated profile (${normalizedConsolidatedCount} teams)`
+            : 'Single team profile';
           const topLineupMatchPayload = safeNumber(row.top_lineup_match_count);
           const topLineupSharePayload = safeNumber(row.top_lineup_match_share);
           const topLineupMatches = topLineupMatchPayload !== null
@@ -659,7 +965,6 @@ export default function TeamSearch({
             ? 'n/a'
             : `${(confidenceOverall * 100).toFixed(1)}%`;
           const confidenceTone = confidenceBand(confidenceOverall);
-          const representativeTeamName = row.representative_team_name || '—';
           const isResultExpanded = expandedCards.has(teamIdText);
 
           return (
@@ -670,19 +975,11 @@ export default function TeamSearch({
                   <p className="result-head-subtitle">{cardSubtitle}</p>
                   <p className="result-purpose">
                     {isConsolidatedProfile
-                      ? 'Compare consolidated identity profile versus one cluster instance.'
+                      ? 'Compare the merged roster history across related registrations.'
                       : 'Inspect team structure and compare against nearby identities.'}
                   </p>
-                  <div className="result-head-badges">
-                    <span className="badge">{idLabel}</span>
-                    <span
-                      className={`badge ${isClustered ? 'badge-cluster' : 'badge-muted'}`}
-                      title={clusterTitle}
-                      aria-label={clusterTitle}
-                    >
-                      {clusterLabel}
-                    </span>
-                    {normalizedConsolidatedCount > 1 ? (
+                  {normalizedConsolidatedCount > 1 ? (
+                    <div className="result-head-badges">
                       <span
                         className="badge badge-consolidated"
                         title={`Merged from ${normalizedConsolidatedCount} teams using lineup overlap + metadata similarity.`}
@@ -690,8 +987,8 @@ export default function TeamSearch({
                       >
                         consolidated · {normalizedConsolidatedCount} teams
                       </span>
-                    ) : null}
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
               </header>
               <div className="result-quick-row">
@@ -756,9 +1053,6 @@ export default function TeamSearch({
                 </div>
                 <div className="player-chip-grid" id={playerListId}>
                   {visiblePlayers.map((player) => {
-                    const contribution = maxCoreMatches > 0
-                      ? Math.round((player.matchesPlayed / maxCoreMatches) * 100)
-                      : 0;
                     const playerShare = matchCount > 0
                       ? Math.round((player.matchesPlayed / matchCount) * 100)
                       : 0;
@@ -775,11 +1069,7 @@ export default function TeamSearch({
                         ) : null}
                         <span
                           className="player-chip-fill"
-                            style={{
-                              width: `${maxCoreMatches > 0
-                              ? Math.max(10, contribution)
-                              : 0}%`,
-                            }}
+                          style={{ width: `${Math.max(0, Math.min(100, playerShare))}%` }}
                           aria-hidden="true"
                         />
                       </>
@@ -901,10 +1191,6 @@ export default function TeamSearch({
                       ) : null}
                     </strong>
                   </div>
-                  <div className="meta-item">
-                    <span>Cluster rep</span>
-                    <strong>{representativeTeamName}</strong>
-                  </div>
                 </div>
 
                 <div className="confidence-panel">
@@ -946,10 +1232,7 @@ export default function TeamSearch({
                     <div>
                       <p className="meta-label">Consolidated history</p>
                     <p className="consolidated-summary">
-                        {pluralizeCount(consolidatedAliasCount, 'alias record')}, {safeInt(matchCount).toLocaleString()} matches across {consolidatedTournamentsCovered}
-                        tournament{consolidatedTournamentsCovered === 1 ? '' : 's'}.
-                        Match-count range {consolidatedMatchRangeMin}–{consolidatedMatchRangeMax}, avg
-                        {` ${consolidatedMatchAverage.toFixed(1)}.`}
+                        {pluralizeCount(consolidatedAliasCount, 'alias')} merged into this profile.
                       </p>
                     </div>
                     {canExpandAliases ? (
@@ -964,41 +1247,16 @@ export default function TeamSearch({
                       </button>
                     ) : null}
                   </div>
-                  {consolidatedMatchBuckets.length ? (
-                    <div className="consolidated-distribution">
-                      {consolidatedMatchBuckets.map((bucket) => {
-                        const width = maxBucketCount > 0
-                          ? Math.round((bucket.count / maxBucketCount) * 100)
-                          : 0;
-                        return (
-                          <div className="consolidated-bucket" key={`${teamIdText}-bucket-${bucket.label}`}>
-                            <div className="consolidated-bucket-label">
-                              <span>{bucket.label}</span>
-                              <span>{pluralizeCount(bucket.count, 'alias')}</span>
-                            </div>
-                            <div className="consolidated-bucket-track">
-                              <span
-                                className="consolidated-bucket-fill"
-                                style={{ width: `${width}%` }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : null}
                   <div className="table-wrap">
                     <p className="meta-label">
-                      {`Top ${Math.min(visibleAliasCount, consolidatedAliasCount)} aliases by matches`}
+                      {`Team aliases (${Math.min(visibleAliasCount, consolidatedAliasCount)} of ${consolidatedAliasCount})`}
                     </p>
                     <table className="consolidated-table" id={aliasListId}>
                       <thead>
                         <tr>
                           <th>Team ID</th>
-                          <th>Alias team</th>
+                          <th>Team alias</th>
                           <th>Matches</th>
-                          <th>Tournaments</th>
-                          <th>Last match</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1009,8 +1267,6 @@ export default function TeamSearch({
                             <td>{safeInt(team.team_id).toLocaleString()}</td>
                             <td>{team.team_name || `Team ${team.team_id}`}</td>
                             <td>{safeInt(team.match_count).toLocaleString()}</td>
-                            <td>{safeInt(team.tournament_count).toLocaleString()}</td>
-                            <td title={fmtDate(team.event_time_ms)}>{relativeOrMissingDate(team.event_time_ms)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -1025,6 +1281,20 @@ export default function TeamSearch({
           );
         })}
       </div>
+
+      {results.length > visibleCount ? (
+        <div className="load-more-wrap">
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={() =>
+              setVisibleCount((prev) => Math.min(prev + 20, results.length))
+            }
+          >
+            Show more ({results.length - visibleCount} remaining)
+          </button>
+        </div>
+      ) : null}
     </section>
   );
 }
