@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from shared_lib.db import create_engine, get_schema, resolve_database_url
 from shared_lib.team_vector_utils import (
@@ -25,6 +26,11 @@ from shared_lib.team_vector_utils import (
 from team_api.sql import get_vector_column_info, ensure_search_tables, validate_identifier
 
 logger = logging.getLogger(__name__)
+
+
+def _is_permission_denied(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "insufficientprivilege" in message or "permission denied" in message
 
 
 def _vector_literal(vector: Sequence[float]) -> str:
@@ -889,7 +895,15 @@ def run_refresh(
     schema = validate_identifier(schema)
     engine = create_engine(target_db_url)
     final_vector_dim = int(semantic_dim) + int(identity_dim)
-    ensure_search_tables(engine, schema, final_vector_dim=final_vector_dim)
+    try:
+        ensure_search_tables(engine, schema, final_vector_dim=final_vector_dim)
+    except SQLAlchemyError as exc:
+        if not _is_permission_denied(exc):
+            raise
+        logger.warning(
+            "Skipping schema bootstrap for %s during refresh due to insufficient privileges.",
+            schema,
+        )
 
     since_ms = _to_ms_days_ago(days)
     until_ms = _to_ms_days_ago(until_days)
