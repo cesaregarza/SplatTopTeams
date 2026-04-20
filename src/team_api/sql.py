@@ -86,6 +86,27 @@ def _execute_ddl_in_savepoint(conn, statement: str) -> bool:
     return True
 
 
+def _require_existing_schema(conn, schema: str) -> None:
+    schema_exists = bool(
+        conn.execute(
+            text(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM information_schema.schemata
+                    WHERE schema_name = :schema
+                )
+                """
+            ),
+            {"schema": schema},
+        ).scalar_one()
+    )
+    if not schema_exists:
+        raise RuntimeError(
+            f"Required schema {schema!r} does not exist. Provision it before bootstrapping team-search tables."
+        )
+
+
 def ensure_search_tables(
     engine: Engine,
     schema: str,
@@ -94,7 +115,6 @@ def ensure_search_tables(
     schema = validate_identifier(schema)
 
     statements = [
-        f"CREATE SCHEMA IF NOT EXISTS {schema}",
         f"""
         CREATE TABLE IF NOT EXISTS {schema}.team_search_refresh_runs (
             run_id BIGSERIAL PRIMARY KEY,
@@ -179,6 +199,7 @@ def ensure_search_tables(
     ]
 
     with engine.begin() as conn:
+        _require_existing_schema(conn, schema)
         for statement in statements:
             conn.execute(text(statement))
         # Backfill-safe column adds for already-existing deployments.
