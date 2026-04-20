@@ -82,3 +82,15 @@ def test_run_refresh_raises_non_permission_bootstrap_error(monkeypatch):
         assert "some other ddl failure" in str(exc)
     else:
         raise AssertionError("Expected non-permission bootstrap error to be raised")
+
+
+def test_resolve_refresh_db_urls_supports_target_override(monkeypatch):
+    args = re.build_parser().parse_args([])
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://shared")
+    monkeypatch.setenv("TARGET_DATABASE_URL", "postgresql://target")
+
+    source_db_url, target_db_url = re._resolve_refresh_db_urls(args)
+
+    assert source_db_url == "postgresql://shared"
+    assert target_db_url == "postgresql://target"

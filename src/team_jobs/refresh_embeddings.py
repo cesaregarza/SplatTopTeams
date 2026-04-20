@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import math
 import logging
+import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1087,20 +1088,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _resolve_refresh_db_urls(args: argparse.Namespace) -> tuple[str, str]:
+    source_explicit = args.source_db_url or os.getenv("SOURCE_DATABASE_URL")
+    target_explicit = args.target_db_url or os.getenv("TARGET_DATABASE_URL")
 
     source_db_url = (
-        resolve_database_url(args.source_db_url) if args.source_db_url else None
+        resolve_database_url(source_explicit) if source_explicit else None
     )
     target_db_url = (
-        resolve_database_url(args.target_db_url) if args.target_db_url else None
+        resolve_database_url(target_explicit) if target_explicit else None
     )
+
     if source_db_url is None or target_db_url is None:
         shared_db_url = resolve_database_url(args.db_url)
         source_db_url = source_db_url or shared_db_url
         target_db_url = target_db_url or shared_db_url
+
+    return source_db_url, target_db_url
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    source_db_url, target_db_url = _resolve_refresh_db_urls(args)
     schema = args.schema or get_schema()
 
     run_id = run_refresh(
