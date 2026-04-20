@@ -206,10 +206,15 @@ export default function AdvancedAnalytics() {
 
   return (
     <section className="panel" aria-labelledby="analytics-title">
-      <h2 id="analytics-title" className="panel-title">Advanced Analytics</h2>
-      <p className="panel-subtitle">
-        Full research console: drift intelligence, embedding-space geometry, outlier forensics, rivalry mapping, and what-if similarity blending.
-      </p>
+      <div className="panel-head">
+        <div>
+          <p className="panel-kicker">Research console</p>
+          <h2 id="analytics-title" className="panel-title">Advanced Analytics</h2>
+          <p className="panel-summary">
+            Drift intelligence, embedding-space geometry, outlier forensics, rivalry mapping, and what-if similarity blending.
+          </p>
+        </div>
+      </div>
 
       <div className="analytics-controls">
         <div className="field">
@@ -266,18 +271,18 @@ export default function AdvancedAnalytics() {
             onChange={(e) => setRosterLimit(Number(e.target.value) || 20)}
           />
         </div>
-        <button className="button" type="button" onClick={refreshAll}>
+        <button className="button btn-pill btn-fuchsia" type="button" onClick={refreshAll}>
           {loading ? 'Refreshing…' : 'Refresh analytics'}
         </button>
       </div>
 
       {error ? <p className="error">{error}</p> : null}
 
-      <div className="analytics-cards">
+      <div className="grid-cols-4 analytics-cards analytics-stats">
         {summaryCards.map((card) => (
-          <article key={card.label} className="analytics-card">
-            <p className="analytics-card-label">{card.label}</p>
-            <p className="analytics-card-value">{card.value}</p>
+          <article key={card.label} className="analytics-card stat">
+            <span className="analytics-card-label stat-label">{card.label}</span>
+            <span className="analytics-card-value stat-value">{card.value}</span>
           </article>
         ))}
       </div>
@@ -287,11 +292,11 @@ export default function AdvancedAnalytics() {
         <p className="meta">
           Current snapshot {drift?.current_snapshot_id ?? 'n/a'} vs baseline {drift?.previous_snapshot_id ?? 'n/a'}.
         </p>
-        <div className="analytics-cards drift-cards">
+        <div className="grid-cols-4 analytics-cards drift-cards analytics-stats">
           {driftCards.map((card) => (
-            <article key={card.label} className="analytics-card">
-              <p className="analytics-card-label">{card.label}</p>
-              <p className="analytics-card-value">{card.value}</p>
+            <article key={card.label} className="analytics-card stat">
+              <span className="analytics-card-label stat-label">{card.label}</span>
+              <span className="analytics-card-value stat-value">{card.value}</span>
             </article>
           ))}
         </div>

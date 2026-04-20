@@ -1081,10 +1081,15 @@ export default function HeadToHead({
 
   return (
     <section className="panel team-search-panel" aria-labelledby="head-to-head-title">
-      <h2 id="head-to-head-title" className="panel-title">Head-to-Head</h2>
-      <p className="panel-subtitle">
-        Search teams, pick Team A and Team B, then load matchup history.
-      </p>
+      <div className="panel-head">
+        <div>
+          <p className="panel-kicker">Matchup review</p>
+          <h2 id="head-to-head-title" className="panel-title">Head-to-Head</h2>
+          <p className="panel-summary">
+            Search teams, pick Team A and Team B, then load matchup history.
+          </p>
+        </div>
+      </div>
 
       <ol className="h2h-stepper" aria-label="Head-to-head flow">
         <li className={stepState.searchDone ? 'is-complete' : 'is-current'}>1 Search</li>
@@ -1092,7 +1097,7 @@ export default function HeadToHead({
         <li className={stepState.compareDone ? 'is-complete' : 'is-current'}>3 Compare</li>
       </ol>
 
-      <form className="search-form" onSubmit={onSearchSubmit}>
+      <form className="form-grid search-form" onSubmit={onSearchSubmit}>
         <div className="h2h-search-row">
           <div className="h2h-search-input-wrap">
             <label htmlFor="head-to-head-query" className="field-label">Team lookup</label>
@@ -1106,7 +1111,7 @@ export default function HeadToHead({
                 onChange={(event) => setQuery(event.target.value)}
                 required
               />
-              <button className="button" type="submit" disabled={searchLoading}>
+              <button className="button btn-pill btn-fuchsia" type="submit" disabled={searchLoading}>
                 {searchLoading ? 'Searching…' : 'Search teams'}
               </button>
             </div>
@@ -1114,7 +1119,7 @@ export default function HeadToHead({
           </div>
           <button
             type="button"
-            className="result-select-btn"
+            className="result-select-btn btn-pill btn-fuchsia-outline"
             onClick={() => setShowAdvancedFilters((value) => !value)}
             aria-expanded={showAdvancedFilters}
             aria-controls="head-to-head-advanced-controls"
@@ -1124,7 +1129,7 @@ export default function HeadToHead({
         </div>
 
         {showAdvancedFilters ? (
-          <div className="row fields-row" id="head-to-head-advanced-controls">
+          <div className="form-row row fields-row" id="head-to-head-advanced-controls">
             <div className="field">
               <label htmlFor="head-to-head-cluster-mode" className="field-label">
                 Cluster profile
@@ -1265,24 +1270,30 @@ export default function HeadToHead({
 
       {searchPayload ? (
         <section className="head-to-head-panel" aria-label="Compact team search results">
+          <div className="results-head">
+            <h3 className="results-title">Search results</h3>
+            <span className="results-count">
+              {searchPayload.result_count ?? 0} groups · snapshot {searchPayload.snapshot_id ?? 'n/a'} · profile {clusterProfileCopy(clusterMode)}
+            </span>
+          </div>
           <div className="head-to-head-result-meta">
             <div className="result-meta-chips">
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip">
                 {searchPayload.result_count ?? 0} result group{(searchPayload.result_count ?? 0) === 1 ? '' : 's'}
               </span>
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip">
                 Snapshot {searchPayload.snapshot_id ?? 'n/a'}
               </span>
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip">
                 Min relevance {(Math.round(minRelevance * 100))}%
               </span>
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip">
                 Profile {clusterProfileCopy(clusterMode)}
               </span>
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip">
                 Consolidation {consolidate ? 'on' : 'off'}
               </span>
-              <span className="result-meta-chip">
+              <span className="result-meta-chip chip chip-accent">
                 Top results {topN}
               </span>
             </div>
@@ -1309,7 +1320,7 @@ export default function HeadToHead({
           </div>
 
           <div className="table-wrap">
-              <table className="head-to-head-table">
+              <table className="head-to-head-table data-table">
                 <thead>
                   <tr>
                     <th>Team</th>
@@ -1550,7 +1561,7 @@ export default function HeadToHead({
             />
           </div>
           <button
-            className="button"
+            className="button btn-pill btn-fuchsia"
             type="submit"
             disabled={!canRunHeadToHead || headToHeadLoading}
           >
@@ -1575,6 +1586,25 @@ export default function HeadToHead({
 
       {headToHeadPayload ? (
         <section className="head-to-head-panel head-to-head-results" aria-label="Head-to-head results">
+          <div className="grid-cols-4 h2h-summary-stats">
+            <div className="stat">
+              <span className="stat-label">Matched matches</span>
+              <span className="stat-value">{totalMatches.toLocaleString()}</span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">{teamARepresentativeGroup}</span>
+              <span className="stat-value">{teamAWinRateText}</span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">{teamBRepresentativeGroup}</span>
+              <span className="stat-value">{teamBWinRateText}</span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">Unresolved</span>
+              <span className="stat-value">{unresolved.toLocaleString()}</span>
+            </div>
+          </div>
+
           <div className="h2h-score-grid result-meta-grid result-meta-subtle">
             <div className="meta-item">
               <span>Snapshot</span>
@@ -1658,7 +1688,7 @@ export default function HeadToHead({
               </select>
             </div>
 
-            <table className="head-to-head-table h2h-match-table">
+            <table className="head-to-head-table h2h-match-table data-table">
               <thead>
                       <tr>
                         <th>Match</th>

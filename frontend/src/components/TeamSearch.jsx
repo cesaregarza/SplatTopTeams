@@ -511,12 +511,17 @@ export default function TeamSearch({
 
   return (
     <section className="panel team-search-panel" aria-labelledby="team-search-title">
-      <h2 id="team-search-title" className="panel-title">Team Search</h2>
-      <p className="panel-subtitle">
-        Search by team name and rank similar teams using identity-anchored embeddings.
-      </p>
+      <div className="panel-head">
+        <div>
+          <p className="panel-kicker">Similarity search</p>
+          <h2 id="team-search-title" className="panel-title">Team Search</h2>
+          <p className="panel-summary">
+            Search by team name, optional tournament scope, and snapshot-aware identity signals.
+          </p>
+        </div>
+      </div>
 
-      <form className="search-form" onSubmit={onSubmit}>
+      <form className="form-grid search-form" onSubmit={onSubmit}>
         <label htmlFor="team-query" className="field-label">Team query</label>
         <div
           className="search-input-wrap"
@@ -586,7 +591,7 @@ export default function TeamSearch({
           </div>
         ) : null}
 
-        <div className="row fields-row tournament-row">
+        <div className="form-row row fields-row tournament-row">
           <div className="field">
             <label htmlFor="tournament-id" className="field-label">Tournament ID (optional)</label>
             <input
@@ -676,7 +681,7 @@ export default function TeamSearch({
 
         {tournamentTeamsError ? <p className="error">{tournamentTeamsError}</p> : null}
 
-        <div className="row fields-row">
+        <div className="form-row row fields-row">
           <div className="field">
             <label htmlFor="cluster-mode" className="field-label">Cluster profile</label>
             <select
@@ -791,8 +796,8 @@ export default function TeamSearch({
           </div>
         </div>
 
-        <button className="button" type="submit" disabled={loading}>
-          {loading ? 'Searching…' : 'Search'}
+        <button className="button btn-pill btn-fuchsia" type="submit" disabled={loading}>
+          {loading ? 'Searching…' : 'Search teams'}
         </button>
       </form>
 
@@ -813,18 +818,27 @@ export default function TeamSearch({
       ) : null}
 
       {results.length > 0 ? (
-        <div className="results-toolbar">
-          <label htmlFor="sort-by" className="field-label">Sort by</label>
-          <select
-            id="sort-by"
-            className="input input-compact"
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value)}
-          >
-            <option value="relevance">Relevance</option>
-            <option value="matches">Match count</option>
-            <option value="recency">Most recent</option>
-          </select>
+        <div className="results-head">
+          <div>
+            <h3 className="results-title">Results</h3>
+            <p className="results-subtitle">Bento profile view with roster, lineup, and confidence evidence.</p>
+          </div>
+          <div className="results-toolbar">
+            <span className="results-count">
+              {results.length} groups · snapshot {payload?.snapshot_id ?? 'n/a'} · profile {clusterMode}
+            </span>
+            <label htmlFor="sort-by" className="field-label">Sort by</label>
+            <select
+              id="sort-by"
+              className="input input-compact"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value)}
+            >
+              <option value="relevance">Relevance</option>
+              <option value="matches">Match count</option>
+              <option value="recency">Most recent</option>
+            </select>
+          </div>
         </div>
       ) : null}
 
@@ -966,315 +980,420 @@ export default function TeamSearch({
             : `${(confidenceOverall * 100).toFixed(1)}%`;
           const confidenceTone = confidenceBand(confidenceOverall);
           const isResultExpanded = expandedCards.has(teamIdText);
+          const bentoRosterPlayers = displayPlayers.slice(0, 5);
+          const exactLastMatch = fmtDate(row.event_time_ms);
+          const freshnessValue = matchCount > 0
+            ? Math.max(0, Math.min(100, 100 - Math.min(100, Math.round((Date.now() - (toEpochMs(row.event_time_ms) || Date.now())) / (1000 * 60 * 60 * 24 * 3)))))
+            : 0;
+          const similarityRows = [
+            { label: 'overall', value: confidenceOverall },
+            { label: 'semantic', value: confidenceSemantic },
+            { label: 'identity', value: confidenceIdentity },
+          ];
 
           return (
-              <article className="result-card" key={teamIdText}>
-              <header className="result-head">
-                <div className="result-head-top">
-                  <h3 className="result-team-title">{teamDisplayName}</h3>
-                  <p className="result-head-subtitle">{cardSubtitle}</p>
-                  <p className="result-purpose">
-                    {isConsolidatedProfile
-                      ? 'Compare the merged roster history across related registrations.'
-                      : 'Inspect team structure and compare against nearby identities.'}
-                  </p>
-                  {normalizedConsolidatedCount > 1 ? (
-                    <div className="result-head-badges">
-                      <span
-                        className="badge badge-consolidated"
-                        title={`Merged from ${normalizedConsolidatedCount} teams using lineup overlap + metadata similarity.`}
-                        aria-label={`Merged from ${normalizedConsolidatedCount} teams using lineup overlap + metadata similarity.`}
-                      >
-                        consolidated · {normalizedConsolidatedCount} teams
-                      </span>
+            <article className={`result-card bento-card-shell ${isResultExpanded ? 'is-expanded' : ''}`} key={teamIdText}>
+              <div className="bento-card">
+                <header className="bento-tile bento-hero">
+                  <div className="bento-hero-rank">#{String(index + 1).padStart(2, '0')}</div>
+                  <div className="bento-hero-main">
+                    <p className="bento-k">team profile</p>
+                    <h3 className="bento-name">{teamDisplayName}</h3>
+                    <p className="bento-meta">id {teamIdText} · {cardSubtitle.toLowerCase()}</p>
+                    <p className="result-purpose">
+                      {isConsolidatedProfile
+                        ? 'Merged roster history across related registrations.'
+                        : 'Roster and lineup evidence for the closest current identity.'}
+                    </p>
+                    <div className="result-quick-metrics">
+                      <span className="chip">{safeInt(matchCount).toLocaleString()} matches</span>
+                      <span className="chip">{safeInt(tournamentCount).toLocaleString()} tournaments</span>
+                      <span className="chip">lineups {safeInt(distinctLineups)}</span>
+                      <span className="chip chip-accent">players {safeInt(playerMetricCount)}</span>
                     </div>
-                  ) : null}
-                </div>
-              </header>
-              <div className="result-quick-row">
-                <p className="result-quick-metrics">
-                  <span>{safeInt(matchCount).toLocaleString()} matches</span>
-                  <span>{safeInt(tournamentCount).toLocaleString()} tournaments</span>
-                  <span>{safeInt(distinctLineups)} lineups</span>
-                  <span>Relevance {confidenceOverallLabel}</span>
-                </p>
-                <div className="result-quick-actions">
-                  <button
-                    type="button"
-                    className={`result-select-btn ${isTeamASelected ? 'is-selected' : ''}`}
-                      onClick={() => onOpenHeadToHead('A', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
-                    aria-pressed={isTeamASelected}
-                    title={isTeamASelected ? 'This is Team A' : 'Select this result as Team A'}
-                  >
-                    {isTeamASelected ? 'Selected as Team A' : 'Select as Team A'}
-                  </button>
-                  <button
-                    type="button"
-                    className={`result-select-btn ${isTeamBSelected ? 'is-selected' : ''}`}
-                      onClick={() => onOpenHeadToHead('B', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
-                    aria-pressed={isTeamBSelected}
-                    title={isTeamBSelected ? 'This is Team B' : 'Select this result as Team B'}
-                  >
-                    {isTeamBSelected ? 'Selected as Team B' : 'Select as Team B'}
-                  </button>
-                  <button
-                    type="button"
-                    className="result-expand-toggle"
-                    onClick={() => toggleCardExpansion(teamIdText)}
-                    aria-expanded={isResultExpanded}
-                  >
-                    {isResultExpanded ? 'Hide details' : 'Show details'}
-                  </button>
-                </div>
-              </div>
-
-              {isResultExpanded ? (
-                <>
-                <section className="player-core" aria-label="Top lineup players">
-                <div className="player-core-header">
-                  <div>
-                    <p className="meta-label">Core lineup players</p>
-                    <p className="player-core-summary">{visiblePlayerSummary}</p>
                   </div>
-                  {canExpandPlayers ? (
-                    <button
-                      type="button"
-                      className="player-core-toggle"
-                      onClick={() => togglePlayerExpansion(teamIdText)}
-                      aria-expanded={isExpanded}
-                      aria-controls={playerListId}
-                    >
-                      {isExpanded
-                        ? `Show top ${maxVisiblePlayers}`
-                        : `Show all ${displayPlayers.length}`
-                      }
-                    </button>
-                  ) : null}
-                </div>
-                <div className="player-chip-grid" id={playerListId}>
-                  {visiblePlayers.map((player) => {
-                    const playerShare = matchCount > 0
-                      ? Math.round((player.matchesPlayed / matchCount) * 100)
-                      : 0;
-                    const chipContent = (
-                      <>
-                        <span className="player-chip-avatar" aria-hidden="true">
-                          {playerInitials(player.name)}
-                        </span>
-                        <span className="player-chip-name">{player.name}</span>
-                        {player.matchesPlayed > 0 ? (
-                          <span className="player-chip-meta">
-                            {formatMatchesPlayed(player.matchesPlayed)} • {playerShare}% of matches
-                          </span>
-                        ) : null}
-                        <span
-                          className="player-chip-fill"
-                          style={{ width: `${Math.max(0, Math.min(100, playerShare))}%` }}
-                          aria-hidden="true"
-                        />
-                      </>
-                    );
-                    return player.sendouUrl ? (
-                      <a
-                        key={`${teamIdText}-${player.id ?? player.name}`}
-                        className="player-chip player-chip-link"
-                        href={player.sendouUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        aria-label={`${player.name} profile on sendou.ink`}
-                      >
-                        {chipContent}
-                      </a>
-                    ) : (
-                      <span
-                          key={`${teamIdText}-${player.id ?? player.name}`}
-                        className="player-chip"
-                      >
-                        {chipContent}
-                      </span>
-                    );
-                  })}
-                </div>
-                {coreMatchLabel ? <p className="player-core-subtext">{coreMatchLabel}</p> : null}
-              </section>
-
-                <div className="result-meta-grid">
-                <div className="meta-item">
-                  <span>Matches</span>
-                  <strong className="meta-item-hero meta-item-primary">
-                    <span>{safeInt(matchCount).toLocaleString()}</span>
-                    {deltaMatchCount ? (
-                      <span className={`meta-delta meta-delta-${deltaMatchCount.direction}`}>
-                        {deltaMatchCount.text}
-                      </span>
-                    ) : null}
-                  </strong>
-                </div>
-                <div className="meta-item">
-                  <span>Tournaments</span>
-                  <strong>
-                    <span>{safeInt(tournamentCount).toLocaleString()}</span>
-                    {deltaTournamentCount ? (
-                      <span className={`meta-delta meta-delta-${deltaTournamentCount.direction}`}>
-                        {deltaTournamentCount.text}
-                      </span>
-                    ) : null}
-                  </strong>
-                </div>
-                <div className="meta-item">
-                  <span>Distinct lineups</span>
-                  <strong>
-                    <span>{safeInt(distinctLineups).toLocaleString()}</span>
-                    {deltaDistinctLineups ? (
-                      <span className={`meta-delta meta-delta-${deltaDistinctLineups.direction}`}>
-                        {deltaDistinctLineups.text}
-                      </span>
-                    ) : null}
-                  </strong>
-                </div>
-                <div className="meta-item meta-item-full">
-                  <span>Top lineup</span>
-                  <strong>By match count</strong>
-                  <span className="meta-subtext">Criterion: match count</span>
-                  <div className="top-lineup-metrics">
-                    <p>
-                      <span>Usage (matches)</span>
-                      <strong>{topLineupUsageLabel}</strong>
-                    </p>
-                    <p>
-                      <span>Share (lineup variants)</span>
-                      <strong>{topLineupShareLabel}</strong>
-                    </p>
-                  </div>
-                  <span className="meta-subtext">
-                      {`Top lineup includes ${topLineupPlayerCount} players.`}
-                  </span>
-                  {topLineupPlayers.length ? (
-                    <ul className="top-lineup-list top-lineup-compact">
-                      {topLineupPlayers.map((player) => (
-                        <li key={`${teamIdText}-${player.id ?? player.name}`} className="top-lineup-chip">
-                          {player.sendouUrl ? (
-                            <a
-                              href={player.sendouUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="top-lineup-link"
-                              aria-label={`${player.name} profile on sendou.ink`}
-                            >
-                              {player.name}
-                            </a>
-                          ) : (
-                            <span className="top-lineup-name">{player.name}</span>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <span className="meta-subtext">n/a</span>
-                  )}
-                </div>
-              </div>
-
-                <div className="result-meta-grid result-meta-subtle">
-                  <div className="meta-item">
-                    <span>Last match</span>
-                    <strong title={fmtDate(row.event_time_ms)}>{relativeOrMissingDate(row.event_time_ms)}</strong>
-                  </div>
-                  <div className="meta-item">
-                    <span>{playerMetricLabel}</span>
-                    <strong>
-                      <span>{safeInt(playerMetricCount).toLocaleString()}</span>
-                      {playerMetricDelta ? (
-                        <span className={`meta-delta meta-delta-${playerMetricDelta.direction}`}>
-                          {playerMetricDelta.text}
-                        </span>
-                      ) : null}
-                    </strong>
-                  </div>
-                </div>
-
-                <div className="confidence-panel">
-                  <div className="confidence-panel-head">
-                    <p className="meta-label">Match confidence</p>
+                  <div className="bento-hero-side">
+                    <div className="sim-score sim-score-strong">
+                      <span className="sim-score-num">{confidenceOverall === null ? 'n/a' : (confidenceOverall * 100).toFixed(1)}</span>
+                      {confidenceOverall === null ? null : <span className="sim-score-unit">%</span>}
+                    </div>
                     <span className={`confidence-badge confidence-${confidenceTone.tone}`}>
                       {confidenceTone.label}
                     </span>
                   </div>
-                  <p className="confidence-score" aria-live="polite">
-                    {confidenceOverallLabel}
-                  </p>
-                  <div className="confidence-track" role="img" aria-label={`Confidence meter ${confidenceOverallLabel}`}>
-                    <span
-                      className={`confidence-fill confidence-${confidenceTone.tone}`}
-                      style={{ width: `${confidenceOverall === null ? 0 : confidenceOverall * 100}%` }}
-                    />
+                  <div className="bento-actions">
+                    <button
+                      type="button"
+                      className={`result-select-btn ${isTeamASelected ? 'is-selected' : ''}`}
+                      onClick={() => onOpenHeadToHead('A', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
+                      aria-pressed={isTeamASelected}
+                      title={isTeamASelected ? 'This is Team A' : 'Select this result as Team A'}
+                    >
+                      {isTeamASelected ? 'Selected as Team A' : 'Select as Team A'}
+                    </button>
+                    <button
+                      type="button"
+                      className={`result-select-btn ${isTeamBSelected ? 'is-selected' : ''}`}
+                      onClick={() => onOpenHeadToHead('B', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
+                      aria-pressed={isTeamBSelected}
+                      title={isTeamBSelected ? 'This is Team B' : 'Select this result as Team B'}
+                    >
+                      {isTeamBSelected ? 'Selected as Team B' : 'Select as Team B'}
+                    </button>
+                    <button
+                      type="button"
+                      className="result-expand-toggle"
+                      onClick={() => toggleCardExpansion(teamIdText)}
+                      aria-expanded={isResultExpanded}
+                    >
+                      {isResultExpanded ? 'Hide details' : 'Show details'}
+                    </button>
                   </div>
-                  <details className="confidence-details">
-                    <summary>Details</summary>
-                    <div className="confidence-metric-row">
-                      <span>Overall</span>
-                      <span>{confidenceOverall === null ? 'n/a' : `${(confidenceOverall * 100).toFixed(1)}%`}</span>
-                    </div>
-                    <div className="confidence-metric-row">
-                      <span>Semantic</span>
-                      <span>{confidenceSemantic === null ? 'n/a' : `${(confidenceSemantic * 100).toFixed(1)}%`}</span>
-                    </div>
-                    <div className="confidence-metric-row">
-                      <span>Identity</span>
-                      <span>{confidenceIdentity === null ? 'n/a' : `${(confidenceIdentity * 100).toFixed(1)}%`}</span>
-                    </div>
-                  </details>
-                </div>
+                </header>
 
-              {normalizedConsolidatedCount > 1 ? (
-                <section className="consolidated-section">
-                  <div className="consolidated-header">
-                    <div>
-                      <p className="meta-label">Consolidated history</p>
-                    <p className="consolidated-summary">
-                        {pluralizeCount(consolidatedAliasCount, 'alias')} merged into this profile.
-                      </p>
-                    </div>
-                    {canExpandAliases ? (
-                      <button
-                        type="button"
-                        className="player-core-toggle"
-                        onClick={() => toggleAliasExpansion(teamIdText)}
-                        aria-expanded={aliasesExpanded}
-                        aria-controls={aliasListId}
-                      >
-                        {aliasesExpanded ? 'View fewer aliases' : `View all ${normalizedConsolidatedCount} aliases`}
-                      </button>
-                    ) : null}
-                  </div>
-                  <div className="table-wrap">
-                    <p className="meta-label">
-                      {`Team aliases (${Math.min(visibleAliasCount, consolidatedAliasCount)} of ${consolidatedAliasCount})`}
-                    </p>
-                    <table className="consolidated-table" id={aliasListId}>
-                      <thead>
-                        <tr>
-                          <th>Team ID</th>
-                          <th>Team alias</th>
-                          <th>Matches</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {visibleAliases.map((team, index) => (
-                          <tr
-                            key={`${teamIdText}-${team.team_id}-${team.team_name || 'team'}-${index}`}
-                          >
-                            <td>{safeInt(team.team_id).toLocaleString()}</td>
-                            <td>{team.team_name || `Team ${team.team_id}`}</td>
-                            <td>{safeInt(team.match_count).toLocaleString()}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                <section className="bento-tile bento-sim" aria-label="Search signal breakdown">
+                  <p className="bento-k">search breakdown</p>
+                  {similarityRows.map((item) => {
+                    const pctValue = item.value === null ? 0 : Math.max(0, Math.min(100, item.value * 100));
+                    return (
+                      <div key={`${teamIdText}-${item.label}`} className="bento-sim-row">
+                        <span className="bento-sim-label">{item.label}</span>
+                        <span className="vm-bar">
+                          <span className="vm-bar-fill" style={{ width: `${pctValue}%` }} />
+                        </span>
+                        <span className="bento-sim-v">
+                          {item.value === null ? 'n/a' : `${pctValue.toFixed(0)}%`}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </section>
+
+                <section className="bento-tile bento-matches">
+                  <p className="bento-k">matches</p>
+                  <p className="bento-big">{safeInt(matchCount).toLocaleString()}</p>
+                  <p className="bento-sub">
+                    {deltaMatchCount ? `${deltaMatchCount.text} vs top result` : 'Top result baseline'}
+                  </p>
+                </section>
+
+                <section className="bento-tile bento-tourneys">
+                  <p className="bento-k">tournaments</p>
+                  <p className="bento-big">{safeInt(tournamentCount).toLocaleString()}</p>
+                  <p className="bento-sub">
+                    {safeInt(distinctLineups).toLocaleString()} lineups · {safeInt(playerMetricCount).toLocaleString()} players
+                  </p>
+                </section>
+
+                <section className="bento-tile bento-fresh">
+                  <p className="bento-k">last match</p>
+                  <p className="bento-big bento-big-date">{relativeOrMissingDate(row.event_time_ms)}</p>
+                  <p className="bento-sub">{exactLastMatch}</p>
+                  <div className="bento-fresh-bar">
+                    <span style={{ width: `${freshnessValue}%` }} />
                   </div>
                 </section>
-              ) : null}
-                </>
+
+                <section className="bento-tile bento-lineup">
+                  <p className="bento-k">top lineup</p>
+                  <p className="bento-big">{safeInt(topLineupMatches).toLocaleString()}</p>
+                  <p className="bento-sub">{topLineupUsageLabel}</p>
+                  {topLineupPlayers.length ? (
+                    <div className="bento-chip-row">
+                      {topLineupPlayers.map((player) => (
+                        <span key={`${teamIdText}-lineup-${player.id ?? player.name}`} className="top-lineup-chip">
+                          {player.name}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
+
+                <section className="bento-tile bento-roster" aria-label="Core roster">
+                  <div className="bento-roster-head">
+                    <div>
+                      <p className="bento-k">core roster</p>
+                      <p className="player-core-summary">{visiblePlayerSummary}</p>
+                    </div>
+                    {normalizedConsolidatedCount > 1 ? (
+                      <span className="chip chip-accent">
+                        consolidated · {normalizedConsolidatedCount}
+                      </span>
+                    ) : null}
+                  </div>
+                  <ul className="bento-roster-list">
+                    {bentoRosterPlayers.map((player) => {
+                      const playerShare = matchCount > 0
+                        ? Math.round((player.matchesPlayed / matchCount) * 100)
+                        : 0;
+                      return (
+                        <li key={`${teamIdText}-bento-${player.id ?? player.name}`}>
+                          <span className="bento-r-role">{player.id ?? '—'}</span>
+                          <span className="bento-r-name">{player.name}</span>
+                          <span className="bento-r-sr">{player.matchesPlayed > 0 ? `${playerShare}%` : 'n/a'}</span>
+                          <span className="bento-r-bar">
+                            <span style={{ width: `${Math.max(0, Math.min(100, playerShare))}%` }} />
+                          </span>
+                          <span className="bento-r-mp">{player.matchesPlayed > 0 ? `${player.matchesPlayed}m` : '—'}</span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {displayPlayers.length > bentoRosterPlayers.length ? (
+                    <p className="bento-merged">
+                      {displayPlayers.length - bentoRosterPlayers.length} more players in the expanded view
+                    </p>
+                  ) : null}
+                </section>
+              </div>
+
+              {isResultExpanded ? (
+                <div className="bento-details">
+                  <section className="player-core" aria-label="Top lineup players">
+                    <div className="player-core-header">
+                      <div>
+                        <p className="meta-label">Core lineup players</p>
+                        <p className="player-core-summary">{visiblePlayerSummary}</p>
+                      </div>
+                      {canExpandPlayers ? (
+                        <button
+                          type="button"
+                          className="player-core-toggle"
+                          onClick={() => togglePlayerExpansion(teamIdText)}
+                          aria-expanded={isExpanded}
+                          aria-controls={playerListId}
+                        >
+                          {isExpanded
+                            ? `Show top ${maxVisiblePlayers}`
+                            : `Show all ${displayPlayers.length}`
+                          }
+                        </button>
+                      ) : null}
+                    </div>
+                    <div className="player-chip-grid" id={playerListId}>
+                      {visiblePlayers.map((player) => {
+                        const playerShare = matchCount > 0
+                          ? Math.round((player.matchesPlayed / matchCount) * 100)
+                          : 0;
+                        const chipContent = (
+                          <>
+                            <span className="player-chip-avatar" aria-hidden="true">
+                              {playerInitials(player.name)}
+                            </span>
+                            <span className="player-chip-name">{player.name}</span>
+                            {player.matchesPlayed > 0 ? (
+                              <span className="player-chip-meta">
+                                {formatMatchesPlayed(player.matchesPlayed)} • {playerShare}% of matches
+                              </span>
+                            ) : null}
+                            <span
+                              className="player-chip-fill"
+                              style={{ width: `${Math.max(0, Math.min(100, playerShare))}%` }}
+                              aria-hidden="true"
+                            />
+                          </>
+                        );
+                        return player.sendouUrl ? (
+                          <a
+                            key={`${teamIdText}-${player.id ?? player.name}`}
+                            className="player-chip player-chip-link"
+                            href={player.sendouUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            aria-label={`${player.name} profile on sendou.ink`}
+                          >
+                            {chipContent}
+                          </a>
+                        ) : (
+                          <span
+                            key={`${teamIdText}-${player.id ?? player.name}`}
+                            className="player-chip"
+                          >
+                            {chipContent}
+                          </span>
+                        );
+                      })}
+                    </div>
+                    {coreMatchLabel ? <p className="player-core-subtext">{coreMatchLabel}</p> : null}
+                  </section>
+
+                  <div className="result-meta-grid">
+                    <div className="meta-item">
+                      <span>Matches</span>
+                      <strong className="meta-item-hero meta-item-primary">
+                        <span>{safeInt(matchCount).toLocaleString()}</span>
+                        {deltaMatchCount ? (
+                          <span className={`meta-delta meta-delta-${deltaMatchCount.direction}`}>
+                            {deltaMatchCount.text}
+                          </span>
+                        ) : null}
+                      </strong>
+                    </div>
+                    <div className="meta-item">
+                      <span>Tournaments</span>
+                      <strong>
+                        <span>{safeInt(tournamentCount).toLocaleString()}</span>
+                        {deltaTournamentCount ? (
+                          <span className={`meta-delta meta-delta-${deltaTournamentCount.direction}`}>
+                            {deltaTournamentCount.text}
+                          </span>
+                        ) : null}
+                      </strong>
+                    </div>
+                    <div className="meta-item">
+                      <span>Distinct lineups</span>
+                      <strong>
+                        <span>{safeInt(distinctLineups).toLocaleString()}</span>
+                        {deltaDistinctLineups ? (
+                          <span className={`meta-delta meta-delta-${deltaDistinctLineups.direction}`}>
+                            {deltaDistinctLineups.text}
+                          </span>
+                        ) : null}
+                      </strong>
+                    </div>
+                    <div className="meta-item meta-item-full">
+                      <span>Top lineup</span>
+                      <strong>By match count</strong>
+                      <span className="meta-subtext">Criterion: match count</span>
+                      <div className="top-lineup-metrics">
+                        <p>
+                          <span>Usage (matches)</span>
+                          <strong>{topLineupUsageLabel}</strong>
+                        </p>
+                        <p>
+                          <span>Share (lineup variants)</span>
+                          <strong>{topLineupShareLabel}</strong>
+                        </p>
+                      </div>
+                      <span className="meta-subtext">
+                        {`Top lineup includes ${topLineupPlayerCount} players.`}
+                      </span>
+                      {topLineupPlayers.length ? (
+                        <ul className="top-lineup-list top-lineup-compact">
+                          {topLineupPlayers.map((player) => (
+                            <li key={`${teamIdText}-${player.id ?? player.name}`} className="top-lineup-chip">
+                              {player.sendouUrl ? (
+                                <a
+                                  href={player.sendouUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="top-lineup-link"
+                                  aria-label={`${player.name} profile on sendou.ink`}
+                                >
+                                  {player.name}
+                                </a>
+                              ) : (
+                                <span className="top-lineup-name">{player.name}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <span className="meta-subtext">n/a</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="result-meta-grid result-meta-subtle">
+                    <div className="meta-item">
+                      <span>Last match</span>
+                      <strong title={fmtDate(row.event_time_ms)}>{relativeOrMissingDate(row.event_time_ms)}</strong>
+                    </div>
+                    <div className="meta-item">
+                      <span>{playerMetricLabel}</span>
+                      <strong>
+                        <span>{safeInt(playerMetricCount).toLocaleString()}</span>
+                        {playerMetricDelta ? (
+                          <span className={`meta-delta meta-delta-${playerMetricDelta.direction}`}>
+                            {playerMetricDelta.text}
+                          </span>
+                        ) : null}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="confidence-panel">
+                    <div className="confidence-panel-head">
+                      <p className="meta-label">Match confidence</p>
+                      <span className={`confidence-badge confidence-${confidenceTone.tone}`}>
+                        {confidenceTone.label}
+                      </span>
+                    </div>
+                    <p className="confidence-score" aria-live="polite">
+                      {confidenceOverallLabel}
+                    </p>
+                    <div className="confidence-track" role="img" aria-label={`Confidence meter ${confidenceOverallLabel}`}>
+                      <span
+                        className={`confidence-fill confidence-${confidenceTone.tone}`}
+                        style={{ width: `${confidenceOverall === null ? 0 : confidenceOverall * 100}%` }}
+                      />
+                    </div>
+                    <details className="confidence-details">
+                      <summary>Details</summary>
+                      <div className="confidence-metric-row">
+                        <span>Overall</span>
+                        <span>{confidenceOverall === null ? 'n/a' : `${(confidenceOverall * 100).toFixed(1)}%`}</span>
+                      </div>
+                      <div className="confidence-metric-row">
+                        <span>Semantic</span>
+                        <span>{confidenceSemantic === null ? 'n/a' : `${(confidenceSemantic * 100).toFixed(1)}%`}</span>
+                      </div>
+                      <div className="confidence-metric-row">
+                        <span>Identity</span>
+                        <span>{confidenceIdentity === null ? 'n/a' : `${(confidenceIdentity * 100).toFixed(1)}%`}</span>
+                      </div>
+                    </details>
+                  </div>
+
+                  {normalizedConsolidatedCount > 1 ? (
+                    <section className="consolidated-section">
+                      <div className="consolidated-header">
+                        <div>
+                          <p className="meta-label">Consolidated history</p>
+                          <p className="consolidated-summary">
+                            {pluralizeCount(consolidatedAliasCount, 'alias')} merged into this profile.
+                          </p>
+                        </div>
+                        {canExpandAliases ? (
+                          <button
+                            type="button"
+                            className="player-core-toggle"
+                            onClick={() => toggleAliasExpansion(teamIdText)}
+                            aria-expanded={aliasesExpanded}
+                            aria-controls={aliasListId}
+                          >
+                            {aliasesExpanded ? 'View fewer aliases' : `View all ${normalizedConsolidatedCount} aliases`}
+                          </button>
+                        ) : null}
+                      </div>
+                      <div className="table-wrap">
+                        <p className="meta-label">
+                          {`Team aliases (${Math.min(visibleAliasCount, consolidatedAliasCount)} of ${consolidatedAliasCount})`}
+                        </p>
+                        <table className="consolidated-table" id={aliasListId}>
+                          <thead>
+                            <tr>
+                              <th>Team ID</th>
+                              <th>Team alias</th>
+                              <th>Matches</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {visibleAliases.map((team, index) => (
+                              <tr
+                                key={`${teamIdText}-${team.team_id}-${team.team_name || 'team'}-${index}`}
+                              >
+                                <td>{safeInt(team.team_id).toLocaleString()}</td>
+                                <td>{team.team_name || `Team ${team.team_id}`}</td>
+                                <td>{safeInt(team.match_count).toLocaleString()}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  ) : null}
+                </div>
               ) : null}
 
             </article>

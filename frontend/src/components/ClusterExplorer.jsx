@@ -60,12 +60,17 @@ export default function ClusterExplorer() {
 
   return (
     <section className="panel" aria-labelledby="cluster-title">
-      <h2 id="cluster-title" className="panel-title">Cluster Explorer</h2>
-      <p className="panel-subtitle">
-        Browse latent team clusters and inspect member iterations.
-      </p>
+      <div className="panel-head">
+        <div>
+          <p className="panel-kicker">Latent groups</p>
+          <h2 id="cluster-title" className="panel-title">Cluster Explorer</h2>
+          <p className="panel-summary">
+            Browse latent team clusters and inspect member iterations.
+          </p>
+        </div>
+      </div>
 
-      <div className="search-form">
+      <div className="form-grid search-form">
         <label htmlFor="cluster-filter" className="field-label">Cluster/team filter</label>
         <input
           id="cluster-filter"
@@ -76,7 +81,7 @@ export default function ClusterExplorer() {
           onChange={(e) => setQuery(e.target.value)}
         />
 
-        <div className="row fields-row">
+        <div className="form-row row fields-row">
           <div className="field">
             <label htmlFor="cluster-mode-2" className="field-label">Profile</label>
             <select
@@ -104,12 +109,17 @@ export default function ClusterExplorer() {
           </div>
         </div>
 
-        <button className="button" type="button" onClick={loadClusters} disabled={loading}>
+        <button className="button btn-pill btn-fuchsia" type="button" onClick={loadClusters} disabled={loading}>
           {loading ? 'Refreshing…' : 'Refresh clusters'}
         </button>
       </div>
 
       {error ? <p className="error">{error}</p> : null}
+
+      <div className="results-head">
+        <h3 className="results-title">Clusters</h3>
+        <span className="results-count">{clusters.length} clusters · profile {clusterMode}</span>
+      </div>
 
       <div className="cluster-layout">
         <div className="cluster-list" role="listbox" aria-label="Cluster list">
@@ -134,10 +144,15 @@ export default function ClusterExplorer() {
         <div className="cluster-detail" aria-live="polite">
           {selectedDetail ? (
             <>
-              <h3>
-                Cluster #{selectedDetail.cluster_id} ({selectedDetail.cluster_size})
-              </h3>
-              <p className="meta">representative {selectedDetail.representative_team_name || 'n/a'}</p>
+              <div className="panel-head cluster-detail-head">
+                <div>
+                  <p className="panel-kicker">Cluster detail</p>
+                  <h3 className="panel-title">
+                    Cluster #{selectedDetail.cluster_id} ({selectedDetail.cluster_size})
+                  </h3>
+                  <p className="panel-summary">representative {selectedDetail.representative_team_name || 'n/a'}</p>
+                </div>
+              </div>
 
               <div className="member-grid">
                 {(selectedDetail.members || []).map((member) => (

@@ -92,123 +92,149 @@ export default function PlayerLookup({ onOpenTeamSearch }) {
   }
 
   return (
-    <section className="player-lookup">
-      <h2 className="section-title">Player Lookup</h2>
-      <p className="section-intro">Search for a player to see which teams they are most associated with.</p>
-
-      <div className="search-input-wrap" style={{ maxWidth: '400px' }}>
-        <input
-          ref={inputRef}
-          type="text"
-          className="input"
-          placeholder="Type a player name..."
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            if (selectedPlayer) setSelectedPlayer(null);
-          }}
-          onFocus={() => {
-            if (suggestions.length > 0) setShowSuggestions(true);
-          }}
-          role="combobox"
-          aria-expanded={showSuggestions}
-          aria-autocomplete="list"
-          aria-controls="player-suggestions"
-        />
-        {showSuggestions && suggestions.length > 0 && (
-          <ul
-            ref={dropdownRef}
-            id="player-suggestions"
-            className="suggestion-dropdown"
-            role="listbox"
-          >
-            {suggestions.map((s) => (
-              <li
-                key={s.player_id}
-                className="suggestion-option"
-                role="option"
-                tabIndex={0}
-                onClick={() => selectPlayer(s)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') selectPlayer(s);
-                }}
-              >
-                <span className="suggestion-name">{s.display_name}</span>
-                <span className="suggestion-meta">
-                  {s.team_count} team{s.team_count !== 1 ? 's' : ''}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
+    <section className="panel player-lookup" aria-labelledby="player-lookup-title">
+      <div className="panel-head">
+        <div>
+          <p className="panel-kicker">Player profile</p>
+          <h2 id="player-lookup-title" className="panel-title">Player Lookup</h2>
+          <p className="panel-summary">Search for a player to see which teams they are most associated with.</p>
+        </div>
       </div>
 
-      {error && <p className="error-text">{error}</p>}
+      <div className="form-grid">
+        <div className="search-input-wrap player-search-wrap">
+          <input
+            ref={inputRef}
+            type="text"
+            className="input"
+            placeholder="Type a player name..."
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              if (selectedPlayer) setSelectedPlayer(null);
+            }}
+            onFocus={() => {
+              if (suggestions.length > 0) setShowSuggestions(true);
+            }}
+            role="combobox"
+            aria-expanded={showSuggestions}
+            aria-autocomplete="list"
+            aria-controls="player-suggestions"
+          />
+          {showSuggestions && suggestions.length > 0 && (
+            <ul
+              ref={dropdownRef}
+              id="player-suggestions"
+              className="suggestion-dropdown"
+              role="listbox"
+            >
+              {suggestions.map((s) => (
+                <li
+                  key={s.player_id}
+                  className="suggestion-option"
+                  role="option"
+                  tabIndex={0}
+                  onClick={() => selectPlayer(s)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') selectPlayer(s);
+                  }}
+                >
+                  <span className="suggestion-name">{s.display_name}</span>
+                  <span className="suggestion-meta">
+                    {s.team_count} team{s.team_count !== 1 ? 's' : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
 
-      {loading && <p className="loading-text">Loading teams...</p>}
+      {error ? <p className="error">{error}</p> : null}
+      {loading ? <p className="status">Loading teams…</p> : null}
 
-      {selectedPlayer && !loading && teams.length === 0 && !error && (
+      {selectedPlayer && !loading && teams.length === 0 && !error ? (
         <div className="empty-state">
           <p className="empty-state-title">No teams found for {selectedPlayer.display_name}</p>
           <p className="empty-state-hint">This player may not appear in any indexed team rosters.</p>
         </div>
-      )}
+      ) : null}
 
-      {selectedPlayer && teams.length > 0 && (
+      {selectedPlayer && teams.length > 0 ? (
         <>
-          <div className="player-info-card">
-            <h3>{selectedPlayer.display_name}</h3>
-            <span className="player-info-meta">
-              {teams.length} team{teams.length !== 1 ? 's' : ''}
-            </span>
+          <div className="results-head">
+            <div className="player-info-card">
+              <div>
+                <p className="panel-kicker">Player record</p>
+                <h3>{selectedPlayer.display_name}</h3>
+              </div>
+              <span className="player-info-meta">
+                {teams.length} team{teams.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+
+            <div className="results-toolbar">
+              <span className="results-count">{teams.length} recent entries</span>
+              <label className="toolbar-label">
+                Sort by{' '}
+                <select className="input-compact" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+                  <option value="matches">Match count</option>
+                  <option value="lineups">Lineup count</option>
+                  <option value="recency">Most recent</option>
+                </select>
+              </label>
+            </div>
           </div>
 
-          <div className="results-toolbar">
-            <label className="toolbar-label">
-              Sort by{' '}
-              <select className="input-compact" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
-                <option value="matches">Match count</option>
-                <option value="lineups">Lineup count</option>
-                <option value="recency">Most recent</option>
-              </select>
-            </label>
-          </div>
-
-          <table className="player-teams-table">
-            <thead>
-              <tr>
-                <th>Team Name</th>
-                <th>Player Matches</th>
-                <th>Lineup Count</th>
-                <th>Last Active</th>
-                <th>Roster</th>
-                {onOpenTeamSearch && <th></th>}
-              </tr>
-            </thead>
-            <tbody>
-              {sortedTeams.map((t) => (
-                <tr key={t.team_id}>
-                  <td className="cell-team-name">{t.team_name || `Team ${t.team_id}`}</td>
-                  <td className="cell-numeric">{t.player_match_count}</td>
-                  <td className="cell-numeric">{t.lineup_count}</td>
-                  <td className="cell-date">{formatDate(t.event_time_ms)}</td>
-                  <td className="cell-roster">{(t.roster_player_names || []).join(', ')}</td>
-                  {onOpenTeamSearch && (
-                    <td>
-                      <button
-                        className="button-secondary button-sm"
-                        onClick={() => onOpenTeamSearch(t.team_name || `Team ${t.team_id}`)}
-                      >
-                        Search similar
-                      </button>
-                    </td>
-                  )}
+          <div className="table-wrap">
+            <table className="player-teams-table data-table">
+              <thead>
+                <tr>
+                  <th>Team Name</th>
+                  <th>Player Matches</th>
+                  <th>Lineup Count</th>
+                  <th>Last Active</th>
+                  <th>Roster</th>
+                  {onOpenTeamSearch && <th></th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sortedTeams.map((t) => (
+                  <tr key={t.team_id}>
+                    <td className="cell-team-name">
+                      {onOpenTeamSearch ? (
+                        <button
+                          type="button"
+                          className="link link-button"
+                          onClick={() => onOpenTeamSearch(t.team_name || `Team ${t.team_id}`)}
+                        >
+                          {t.team_name || `Team ${t.team_id}`}
+                        </button>
+                      ) : (
+                        <span>{t.team_name || `Team ${t.team_id}`}</span>
+                      )}
+                    </td>
+                    <td className="cell-numeric cell-num">{t.player_match_count}</td>
+                    <td className="cell-numeric cell-num">{t.lineup_count}</td>
+                    <td className="cell-date cell-mute">{formatDate(t.event_time_ms)}</td>
+                    <td className="cell-roster cell-mute">{(t.roster_player_names || []).join(', ')}</td>
+                    {onOpenTeamSearch && (
+                      <td>
+                        <button
+                          className="button-secondary button-sm btn-pill btn-fuchsia-outline"
+                          onClick={() => onOpenTeamSearch(t.team_name || `Team ${t.team_id}`)}
+                        >
+                          Search similar
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </>
-      )}
+      ) : null}
     </section>
   );
 }
