@@ -170,6 +170,132 @@ function buildRecentForm(matches, limit = 5) {
   }));
 }
 
+function matchTone(row) {
+  return row?.team_is_winner ? 'is-win' : row?.opponent_is_winner ? 'is-loss' : 'is-pending';
+}
+
+function matchResultLabel(row) {
+  if (row?.team_is_winner) return 'Win';
+  if (row?.opponent_is_winner) return 'Loss';
+  return 'Unresolved';
+}
+
+function matchScoreLabel(row) {
+  return `${row?.team_score ?? '—'} - ${row?.opponent_score ?? '—'}`;
+}
+
+function buildMatchEvents(matches) {
+  if (!Array.isArray(matches) || !matches.length) return [];
+
+  const groups = new Map();
+
+  for (const row of matches) {
+    const tournamentId = Number(row?.tournament_id);
+    const tournamentName = String(row?.tournament_name || '').trim() || `Tournament ${row?.tournament_id ?? 'n/a'}`;
+    const key = Number.isFinite(tournamentId) && tournamentId > 0
+      ? `tournament:${Math.trunc(tournamentId)}`
+      : `name:${tournamentName.toLowerCase()}`;
+    const eventTimeMs = Number(row?.event_time_ms) || 0;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        tournamentId: Number.isFinite(tournamentId) && tournamentId > 0 ? Math.trunc(tournamentId) : null,
+        tournamentName,
+        tournamentTier: row?.tournament_score_tier || 'Unscored',
+        latestEventTimeMs: eventTimeMs,
+        wins: 0,
+        losses: 0,
+        rows: [],
+      });
+    }
+
+    const group = groups.get(key);
+    group.latestEventTimeMs = Math.max(group.latestEventTimeMs, eventTimeMs);
+    if (group.tournamentTier === 'Unscored' && row?.tournament_score_tier) {
+      group.tournamentTier = row.tournament_score_tier;
+    }
+
+    const tone = matchTone(row);
+    if (tone === 'is-win') group.wins += 1;
+    if (tone === 'is-loss') group.losses += 1;
+
+    group.rows.push({
+      key: row?.match_id ?? `${key}-${eventTimeMs}-${row?.opponent_team_id ?? 'na'}`,
+      eventTimeMs,
+      tone,
+      resultLabel: matchResultLabel(row),
+      relativeDate: relativeDate(row?.event_time_ms),
+      opponentTeamId: row?.opponent_team_id ? Number(row.opponent_team_id) : null,
+      opponentTeamName: row?.opponent_team_name || 'Unknown opponent',
+      scoreLabel: matchScoreLabel(row),
+      teamRosterLabel: rosterPreview(row?.team_roster),
+      opponentRosterLabel: rosterPreview(row?.opponent_roster),
+    });
+  }
+
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      whenLabel: group.latestEventTimeMs ? relativeDate(group.latestEventTimeMs) : 'n/a',
+      rows: group.rows.sort((left, right) => {
+        const leftScore = Number(left.eventTimeMs || 0);
+        const rightScore = Number(right.eventTimeMs || 0);
+        return rightScore - leftScore;
+      }),
+    }))
+    .sort((left, right) => right.latestEventTimeMs - left.latestEventTimeMs);
+}
+
+function normalizeTimelineName(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return 'unnamed-team';
+  const normalized = typeof raw.normalize === 'function' ? raw.normalize('NFKC') : raw;
+  return normalized.toLowerCase().replace(/\s+/g, ' ');
+}
+
+function buildNameTimeline(rows) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+
+  const groups = new Map();
+
+  for (const row of rows) {
+    const displayName = String(row?.team_name || '').trim() || `Team ${row?.team_id ?? 'n/a'}`;
+    const key = normalizeTimelineName(displayName);
+    const eventTimeMs = Number(row?.event_time_ms) || 0;
+    const matchCount = Number(row?.match_count) || 0;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        name: displayName,
+        latestEventTimeMs: eventTimeMs,
+        registrationCount: 0,
+        totalMatches: 0,
+      });
+    }
+
+    const group = groups.get(key);
+    group.registrationCount += 1;
+    group.totalMatches += matchCount;
+
+    if (eventTimeMs >= group.latestEventTimeMs) {
+      group.latestEventTimeMs = eventTimeMs;
+      group.name = displayName;
+    }
+  }
+
+  return Array.from(groups.values()).sort((left, right) => {
+    if (right.latestEventTimeMs !== left.latestEventTimeMs) {
+      return right.latestEventTimeMs - left.latestEventTimeMs;
+    }
+    if (right.totalMatches !== left.totalMatches) {
+      return right.totalMatches - left.totalMatches;
+    }
+    return left.name.localeCompare(right.name);
+  });
+}
+
 function resolveTeamProfileRow(rows, teamIds) {
   if (!Array.isArray(rows) || !rows.length) return null;
   return rows.find((row) => rowMatchesSelectedTeam(row, teamIds))
@@ -396,7 +522,9 @@ export default function TeamExplorer({
       .filter((row) => row?.team_id)
       .sort((a, b) => Number(b?.event_time_ms || 0) - Number(a?.event_time_ms || 0));
   }, [teamProfile]);
+  const nameTimelineRows = useMemo(() => buildNameTimeline(registrationRows), [registrationRows]);
   const comparableRows = neighborsRows.slice(0, 8);
+  const matchEvents = useMemo(() => buildMatchEvents(matches), [matches]);
   const teamSummaryLine = useMemo(() => {
     if (!pageTitle) return '';
     const bits = [
@@ -429,6 +557,10 @@ export default function TeamExplorer({
 
     return `Individual mode is using exactly ${selectedFamilyIds.length} ID${selectedFamilyIds.length === 1 ? '' : 's'}.`;
   }, [enteredIds, selectedFamilyIds, teamScope]);
+  const scopeExpanded = teamScope === 'family'
+    && enteredIds.length
+    && selectedFamilyIds.length
+    && !sameTeamIds(enteredIds, selectedFamilyIds);
 
   async function onSubmit(event) {
     event.preventDefault();
@@ -465,17 +597,29 @@ export default function TeamExplorer({
               : 'Individual mode uses exactly the IDs entered here.'}
           </span>
         </div>
-        <div className="field">
-          <label className="field-label" htmlFor="team-detail-scope">Scope</label>
-          <select
-            id="team-detail-scope"
-            className="input"
-            value={teamScope}
-            onChange={(event) => setTeamScope(event.target.value)}
-          >
-            <option value="family">Full family</option>
-            <option value="individual">Individual ID only</option>
-          </select>
+        <div className="field team-scope-field">
+          <label className="field-label" htmlFor="team-detail-scope-family">Scope</label>
+          <div className="team-scope-segmented" role="tablist" aria-label="Team scope">
+            <button
+              id="team-detail-scope-family"
+              type="button"
+              role="tab"
+              aria-selected={teamScope === 'family'}
+              className={teamScope === 'family' ? 'is-on' : ''}
+              onClick={() => setTeamScope('family')}
+            >
+              Family
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={teamScope === 'individual'}
+              className={teamScope === 'individual' ? 'is-on' : ''}
+              onClick={() => setTeamScope('individual')}
+            >
+              Individual
+            </button>
+          </div>
         </div>
         <button type="submit" className="button btn-pill btn-fuchsia" disabled={loading}>
           {loading ? 'Loading…' : 'Load team'}
@@ -496,10 +640,47 @@ export default function TeamExplorer({
       {team || effectiveSummary ? (
         <>
           {scopeSummary ? (
-            <p className="meta">{scopeSummary}</p>
+            <div className="team-scope-banner" role="status">
+              <span className="team-scope-icon">{teamScope === 'family' ? 'F' : '1'}</span>
+              <span>
+                {scopeExpanded
+                  ? `Family mode expanded ${enteredIds[0]} into ${selectedFamilyIds.length} related registrations.`
+                  : scopeSummary}
+              </span>
+            </div>
           ) : null}
           {teamSummaryLine ? (
             <p className="team-analyst-summary">{teamSummaryLine}</p>
+          ) : null}
+          {nameTimelineRows.length ? (
+            <div className="team-alias-strip">
+              <div className="team-alias-head">
+                <p className="team-alias-kicker">
+                  Name history{teamScope === 'family' ? ` · family of ${selectedFamilyIds.length}` : ''}
+                </p>
+                <span className="team-alias-meta">newest unique names → oldest</span>
+              </div>
+              <div className="team-alias-rail">
+                {nameTimelineRows.map((row, index) => {
+                  const isCurrent = index === 0;
+                  return (
+                    <div
+                      key={`team-alias-${row.key}`}
+                      className={`team-alias-item ${isCurrent ? 'is-current' : ''}`}
+                      title={`${row.name} · ${row.registrationCount} registration${row.registrationCount === 1 ? '' : 's'} · ${row.totalMatches} matches`}
+                    >
+                      <div className="team-alias-name">{row.name}</div>
+                      <div className="team-alias-date">
+                        {row.latestEventTimeMs ? relativeDate(row.latestEventTimeMs) : 'n/a'}
+                      </div>
+                      <div className="team-alias-matches">
+                        {row.registrationCount} registration{row.registrationCount === 1 ? '' : 's'} · {row.totalMatches} matches
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           ) : null}
 
           <div className="analytics-cards team-summary-grid analytics-stats">
@@ -547,62 +728,58 @@ export default function TeamExplorer({
                   </p>
                 </div>
               </div>
-              <div className="table-wrap">
-                <table className="analytics-table">
-                  <thead>
-                    <tr>
-                      <th>Player</th>
-                      <th>Matches</th>
-                      <th>Share</th>
-                      <th>Role</th>
-                      <th>Links</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {teamProfilePlayers.length ? teamProfilePlayers.map((player, index) => {
-                      const share = playerBaselineMatches > 0
-                        ? Math.round((player.matchesPlayed / playerBaselineMatches) * 100)
-                        : 0;
-                      return (
-                        <tr key={`team-player-${player.id ?? player.name}`}>
-                          <td className="analytics-team-name">
-                            <span>{player.name}</span>
-                          </td>
-                          <td>{player.matchesPlayed > 0 ? player.matchesPlayed : '—'}</td>
-                          <td>{player.matchesPlayed > 0 ? `${share}%` : 'n/a'}</td>
-                          <td>{playerRole(player, playerBaselineMatches, index)}</td>
-                          <td>
-                            <div className="team-row-actions">
-                              <button
-                                type="button"
-                                className="button button-secondary"
-                                disabled={player.id === null}
-                                onClick={() => onOpenPlayerLookup(player.id, player.name)}
-                              >
-                                Player history
-                              </button>
-                              {player.sendouUrl ? (
-                                <a
-                                  className="button button-secondary"
-                                  href={player.sendouUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  sendou.ink
-                                </a>
-                              ) : null}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    }) : (
-                      <tr>
-                        <td colSpan={5} className="table-empty-cell">No player profile data available yet.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
+              {teamProfilePlayers.length ? (
+                <ul className="team-roster-list">
+                  {teamProfilePlayers.map((player, index) => {
+                    const share = playerBaselineMatches > 0
+                      ? Math.round((player.matchesPlayed / playerBaselineMatches) * 100)
+                      : 0;
+                    const role = playerRole(player, playerBaselineMatches, index);
+                    const roleKey = role.toLowerCase().replace(/\s+/g, '-');
+                    return (
+                      <li key={`team-player-${player.id ?? player.name}`} className="team-roster-row">
+                        <div className="team-roster-name">
+                          <span>{player.name}</span>
+                          <span className={`team-roster-role is-${roleKey}`}>{role}</span>
+                        </div>
+                        <span className="team-roster-matches">
+                          {player.matchesPlayed > 0 ? player.matchesPlayed : '—'}
+                        </span>
+                        <div className="team-roster-bar" aria-hidden="true">
+                          <span style={{ width: `${Math.max(0, Math.min(share, 100))}%` }} />
+                        </div>
+                        <span className="team-roster-share">
+                          {player.matchesPlayed > 0 ? `${share}%` : 'n/a'}
+                        </span>
+                        <div className="team-compact-actions team-roster-actions">
+                          <button
+                            type="button"
+                            className="button button-secondary team-compact-button"
+                            disabled={player.id === null}
+                            onClick={() => onOpenPlayerLookup(player.id, player.name)}
+                            aria-label={`Open player history for ${player.name}`}
+                          >
+                            History
+                          </button>
+                          {player.sendouUrl ? (
+                            <a
+                              className="button button-secondary team-compact-button"
+                              href={player.sendouUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              aria-label={`Open sendou.ink profile for ${player.name}`}
+                            >
+                              sendou
+                            </a>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="team-missing-note">No player profile data available yet.</p>
+              )}
             </article>
 
             <article className="analytics-panel">
@@ -632,7 +809,7 @@ export default function TeamExplorer({
               </div>
 
               <div className="team-rotation-block">
-                <h4>Rotation Watch</h4>
+                <h4>Supporting Players</h4>
                 {rotationPlayers.length ? (
                   <ul className="team-rotation-list">
                     {rotationPlayers.map((player) => (
@@ -645,7 +822,7 @@ export default function TeamExplorer({
                     ))}
                   </ul>
                 ) : (
-                  <p className="meta">No rotation players surfaced beyond the core four.</p>
+                  <p className="meta">No supporting players surfaced beyond the core four.</p>
                 )}
               </div>
             </article>
@@ -677,52 +854,48 @@ export default function TeamExplorer({
               </div>
             ) : null}
             {matches.length ? (
-              <div className="table-wrap">
-                <table className="analytics-table team-match-table">
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Opponent</th>
-                      <th>Result</th>
-                      <th>Score</th>
-                      <th>Tournament</th>
-                      <th>Roster</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {matches.map((row) => (
-                      <tr key={`team-match-${row.match_id}`}>
-                        <td title={fmtDate(row.event_time_ms)}>{relativeDate(row.event_time_ms)}</td>
-                        <td className="analytics-team-name team-match-opponent">{row.opponent_team_name}</td>
-                        <td>
-                          <span className={`team-result-pill ${row.team_is_winner ? 'is-win' : row.opponent_is_winner ? 'is-loss' : 'is-pending'}`}>
-                            {row.team_is_winner ? 'Win' : row.opponent_is_winner ? 'Loss' : 'Unresolved'}
+              <div className="team-match-events">
+                {matchEvents.map((event) => (
+                  <section key={event.key} className="team-match-event">
+                    <header className="team-match-event-head">
+                      <div className="team-match-event-title">
+                        <span className="team-match-event-name">{event.tournamentName}</span>
+                        <span className="team-match-event-meta">
+                          {event.whenLabel} · {event.rows.length} match{event.rows.length === 1 ? '' : 'es'} · {event.wins}-{event.losses}
+                        </span>
+                      </div>
+                      <span className="team-match-event-tier">{event.tournamentTier || 'Unscored'}</span>
+                      <div className="team-match-event-ribbon" aria-label="Results ribbon">
+                        {event.rows.map((row) => (
+                          <span
+                            key={`ribbon-${row.key}`}
+                            className={`team-match-ribbon-cell ${row.tone}`}
+                            title={`${row.opponentTeamName}: ${row.scoreLabel}`}
+                          />
+                        ))}
+                      </div>
+                    </header>
+                    <div className="team-match-rows">
+                      {event.rows.map((row) => (
+                        <div key={row.key} className="team-match-row">
+                          <span className="team-match-date">{row.relativeDate}</span>
+                          <span className="team-match-opp">{row.opponentTeamName}</span>
+                          <span className="team-match-score">{row.scoreLabel}</span>
+                          <span className="team-match-roster">
+                            {row.teamRosterLabel}
+                            <br />
+                            <span className="meta">vs {row.opponentRosterLabel}</span>
                           </span>
-                        </td>
-                        <td>{row.team_score ?? '—'} - {row.opponent_score ?? '—'}</td>
-                        <td>
-                          <div className="team-table-stack">
-                            <span>{row.tournament_name || `Tournament ${row.tournament_id ?? 'n/a'}`}</span>
-                            <span className="meta">{row.tournament_score_tier || 'Unscored'}</span>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="team-table-stack">
-                            <span>{rosterPreview(row.team_roster)}</span>
-                            <span className="meta">vs {rosterPreview(row.opponent_roster)}</span>
-                          </div>
-                        </td>
-                        <td>
+                          <span className={`team-result-pill ${row.tone}`}>{row.resultLabel}</span>
                           <div className="team-row-actions">
                             <button
                               type="button"
                               className="button button-secondary"
-                              disabled={!row.opponent_team_id}
+                              disabled={!row.opponentTeamId}
                               onClick={() => onOpenHeadToHead(
                                 selectedFamilyIds,
-                                row.opponent_team_id ? [row.opponent_team_id] : [],
-                                null,
+                                row.opponentTeamId ? [row.opponentTeamId] : [],
+                                actionSnapshotId,
                               )}
                             >
                               Compare
@@ -730,21 +903,21 @@ export default function TeamExplorer({
                             <button
                               type="button"
                               className="button button-secondary"
-                              disabled={!row.opponent_team_id}
+                              disabled={!row.opponentTeamId}
                               onClick={() => onOpenTeamPage(
-                                row.opponent_team_id ? [row.opponent_team_id] : [],
-                                row.opponent_team_name,
-                                null,
+                                row.opponentTeamId ? [row.opponentTeamId] : [],
+                                row.opponentTeamName,
+                                actionSnapshotId,
                               )}
                             >
                               Open
                             </button>
                           </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                ))}
               </div>
             ) : (
               <p className="team-missing-note">
@@ -759,7 +932,7 @@ export default function TeamExplorer({
                 <div>
                   <h3>Event Timeline</h3>
                   <p className="meta">
-                    Recent registrations and names used by this roster family.
+                    Consolidated names used by this roster family, ordered by last appearance.
                   </p>
                 </div>
               </div>
@@ -767,21 +940,23 @@ export default function TeamExplorer({
                 <table className="analytics-table">
                   <thead>
                     <tr>
-                      <th>Date</th>
-                      <th>Name Used</th>
+                      <th>Last seen</th>
+                      <th>Name</th>
+                      <th>Registrations</th>
                       <th>Matches</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {registrationRows.length ? registrationRows.map((row) => (
-                      <tr key={`registration-${row.team_id}-${row.event_time_ms ?? 'na'}`}>
-                        <td title={fmtDate(row.event_time_ms)}>{row.event_time_ms ? relativeDate(row.event_time_ms) : 'n/a'}</td>
-                        <td className="analytics-team-name">{row.team_name || `Team ${row.team_id}`}</td>
-                        <td>{row.match_count ?? 'n/a'}</td>
+                    {nameTimelineRows.length ? nameTimelineRows.map((row) => (
+                      <tr key={`registration-${row.key}`}>
+                        <td title={fmtDate(row.latestEventTimeMs)}>{row.latestEventTimeMs ? relativeDate(row.latestEventTimeMs) : 'n/a'}</td>
+                        <td className="analytics-team-name">{row.name}</td>
+                        <td>{row.registrationCount}</td>
+                        <td>{row.totalMatches}</td>
                       </tr>
                     )) : (
                       <tr>
-                        <td colSpan={3} className="table-empty-cell">No registration history available yet.</td>
+                        <td colSpan={4} className="table-empty-cell">No registration history available yet.</td>
                       </tr>
                     )}
                   </tbody>
@@ -790,51 +965,44 @@ export default function TeamExplorer({
             </article>
 
             <article className="analytics-panel">
-              <h3>Comparable Teams</h3>
-              <p className="meta">Teams with similar roster construction and lineup usage.</p>
-              <div className="table-wrap">
-                <table className="analytics-table">
-                  <thead>
-                    <tr>
-                      <th>Team</th>
-                      <th>Profile Match</th>
-                      <th>Lineups</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {comparableRows.length ? comparableRows.map((row) => (
-                      <tr key={`team-neighbor-${row.team_id}`}>
-                        <td className="analytics-team-name">{row.team_name}</td>
-                        <td>{pct(row.sim_to_query)}</td>
-                        <td>{row.lineup_count ?? 'n/a'}</td>
-                        <td>
-                          <div className="team-row-actions">
-                            <button
-                              type="button"
-                              className="button button-secondary"
-                              onClick={() => onOpenHeadToHead(selectedFamilyIds, [row.team_id], actionSnapshotId)}
-                            >
-                              Compare
-                            </button>
-                            <button
-                              type="button"
-                              className="button button-secondary"
-                              onClick={() => onOpenTeamPage([row.team_id], row.team_name, actionSnapshotId)}
-                            >
-                              Open
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    )) : (
-                      <tr>
-                        <td colSpan={4} className="table-empty-cell">No comparable teams loaded yet.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
+              <div className="team-section-heading">
+                <div>
+                  <h3>Comparable Teams</h3>
+                  <p className="meta">Teams with similar roster construction and lineup usage. Volume reflects indexed observations, not distinct lineups.</p>
+                </div>
               </div>
+              {comparableRows.length ? (
+                <ul className="team-compare-list">
+                  {comparableRows.map((row) => (
+                    <li key={`team-neighbor-${row.team_id}`} className="team-compare-row">
+                      <span className="team-compare-name">{row.team_name}</span>
+                      <div className="team-compare-match" aria-hidden="true">
+                        <span style={{ width: `${Math.max(0, Math.min(Number(row.sim_to_query || 0) * 100, 100))}%` }} />
+                      </div>
+                      <span className="team-compare-pct">{pct(row.sim_to_query)}</span>
+                      <span className="team-compare-lineups">{row.lineup_count ?? 'n/a'} observations</span>
+                      <div className="team-compact-actions">
+                        <button
+                          type="button"
+                          className="button button-secondary team-compact-button"
+                          onClick={() => onOpenHeadToHead(selectedFamilyIds, [row.team_id], actionSnapshotId)}
+                        >
+                          Compare
+                        </button>
+                        <button
+                          type="button"
+                          className="button button-secondary team-compact-button"
+                          onClick={() => onOpenTeamPage([row.team_id], row.team_name, actionSnapshotId)}
+                        >
+                          Open
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="team-missing-note">No comparable teams loaded yet.</p>
+              )}
             </article>
           </div>
         </>

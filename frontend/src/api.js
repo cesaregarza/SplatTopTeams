@@ -1,6 +1,7 @@
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 const TEAM_MATCHES_FALLBACK_BASE = import.meta.env.VITE_MATCHES_API_BASE
   || (import.meta.env.DEV ? '/__splat_top_api' : 'https://splat.top');
+const TRANSIENT_GATEWAY_STATUSES = new Set([502, 503, 504]);
 
 function replaceFamilyClusterMode(path) {
   const queryStart = path.indexOf('?');
@@ -42,11 +43,41 @@ function buildRequestUrl(path, base = API_BASE) {
   return `${base}${path}`;
 }
 
+function isSafeRetryMethod(method) {
+  if (!method) return true;
+  return String(method).toUpperCase() === 'GET';
+}
+
+function looksLikeHtmlGatewayPage(text) {
+  if (typeof text !== 'string' || !text.trim()) return false;
+  const normalized = text.toLowerCase();
+  return normalized.includes('<html')
+    && (normalized.includes('bad gateway')
+      || normalized.includes('nginx')
+      || normalized.includes('<body'));
+}
+
+function friendlyErrorMessage(path, status, text) {
+  if (TRANSIENT_GATEWAY_STATUSES.has(status) && looksLikeHtmlGatewayPage(text)) {
+    if (path.startsWith('/api/team-search')) {
+      return 'Team search is temporarily unavailable. Try again in a moment.';
+    }
+    return 'The API is temporarily unavailable. Try again in a moment.';
+  }
+  return text || `Request failed: ${status}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function requestJson(path, options = {}) {
   return requestJsonWithBase(path, API_BASE, options);
 }
 
-async function requestJsonWithBase(path, base = API_BASE, options = {}) {
+async function requestJsonWithBase(path, base = API_BASE, options = {}, attempt = 0) {
   const response = await fetch(buildRequestUrl(path, base), {
     headers: {
       'Content-Type': 'application/json',
@@ -59,10 +90,15 @@ async function requestJsonWithBase(path, base = API_BASE, options = {}) {
     const text = await response.text();
     const fallbackPath = replaceFamilyClusterMode(path);
     if (fallbackPath && isUnsupportedFamilyClusterModeError(response.status, text)) {
-      return requestJsonWithBase(fallbackPath, base, options);
+      return requestJsonWithBase(fallbackPath, base, options, attempt);
     }
 
-    const error = new Error(text || `Request failed: ${response.status}`);
+    if (attempt < 1 && isSafeRetryMethod(options.method) && TRANSIENT_GATEWAY_STATUSES.has(response.status)) {
+      await wait(250);
+      return requestJsonWithBase(path, base, options, attempt + 1);
+    }
+
+    const error = new Error(friendlyErrorMessage(path, response.status, text));
     error.status = response.status;
     error.responseText = text;
     error.url = buildRequestUrl(path, base);
