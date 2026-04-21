@@ -4,6 +4,7 @@ import { fetchHealth } from './api';
 import ClusterExplorer from './components/ClusterExplorer';
 import HeadToHead from './components/HeadToHead';
 import PlayerLookup from './components/PlayerLookup';
+import TeamExplorer from './components/TeamExplorer';
 import TeamSearch from './components/TeamSearch';
 
 function parseTeamIds(value) {
@@ -61,6 +62,12 @@ export default function App() {
   const [headToHeadTeamAIds, setHeadToHeadTeamAIds] = useState([]);
   const [headToHeadTeamBIds, setHeadToHeadTeamBIds] = useState([]);
   const [headToHeadSnapshotId, setHeadToHeadSnapshotId] = useState('');
+  const [selectedTeamProfileId, setSelectedTeamProfileId] = useState('');
+  const [selectedTeamProfileIds, setSelectedTeamProfileIds] = useState([]);
+  const [selectedTeamProfileName, setSelectedTeamProfileName] = useState('');
+  const [selectedTeamProfileSnapshotId, setSelectedTeamProfileSnapshotId] = useState('');
+  const [selectedPlayerProfileId, setSelectedPlayerProfileId] = useState('');
+  const [selectedPlayerProfileName, setSelectedPlayerProfileName] = useState('');
 
   useEffect(() => {
     fetchHealth().then(setHealth).catch(() => setHealth(null));
@@ -68,6 +75,7 @@ export default function App() {
 
   const tabs = useMemo(() => ([
     { id: 'search', label: 'Team Search' },
+    { id: 'teams', label: 'Teams' },
     { id: 'players', label: 'Player Lookup' },
     { id: 'head-to-head', label: 'Head-to-Head' },
     { id: 'clusters', label: 'Cluster Explorer' },
@@ -115,6 +123,41 @@ export default function App() {
     }
   }
 
+  function openHeadToHeadPair(teamAIds, teamBIds, snapshotId = null) {
+    const nextTeamAIds = uniqueTeamIds(parseTeamIds(teamAIds));
+    const nextTeamBIds = uniqueTeamIds(parseTeamIds(teamBIds)).filter(
+      (teamId) => !nextTeamAIds.includes(teamId),
+    );
+
+    setHeadToHeadTeamAId(nextTeamAIds[0] ? String(nextTeamAIds[0]) : '');
+    setHeadToHeadTeamAIds(nextTeamAIds);
+    setHeadToHeadTeamBId(nextTeamBIds[0] ? String(nextTeamBIds[0]) : '');
+    setHeadToHeadTeamBIds(nextTeamBIds);
+    if (snapshotId !== null && snapshotId !== undefined && String(snapshotId).trim() !== '') {
+      setHeadToHeadSnapshotId(String(snapshotId).trim());
+    }
+    setTab('head-to-head');
+  }
+
+  function openTeamPage(teamIds, teamName = '', snapshotId = null) {
+    const nextIds = uniqueTeamIds(parseTeamIds(teamIds));
+    setSelectedTeamProfileId(nextIds[0] ? String(nextIds[0]) : '');
+    setSelectedTeamProfileIds(nextIds);
+    setSelectedTeamProfileName(String(teamName || '').trim());
+    if (snapshotId !== null && snapshotId !== undefined && String(snapshotId).trim() !== '') {
+      setSelectedTeamProfileSnapshotId(String(snapshotId).trim());
+    }
+    setTab('teams');
+  }
+
+  function openPlayerPage(playerId, playerName = '') {
+    const parsed = Number(playerId);
+    if (!Number.isFinite(parsed) || parsed <= 0) return;
+    setSelectedPlayerProfileId(String(Math.trunc(parsed)));
+    setSelectedPlayerProfileName(String(playerName || '').trim());
+    setTab('players');
+  }
+
   return (
     <div className="page-shell shell">
       <header className="site-header">
@@ -122,7 +165,7 @@ export default function App() {
           <div className="header-top">
             <div className="header-copy">
               <div className="crumb">
-                <a href="#" className="brand-pill">comp.splat.top</a>
+                <a href="https://comp.splat.top" className="brand-pill" target="_blank" rel="noreferrer">comp.splat.top</a>
                 <span className="crumb-divider" aria-hidden="true" />
                 <span className="crumb-parent">Discovery</span>
                 <span className="crumb-sep" aria-hidden="true">/</span>
@@ -200,14 +243,36 @@ export default function App() {
             selectedTeamBId={headToHeadTeamBId}
             selectedTeamAIds={headToHeadTeamAIds}
             selectedTeamBIds={headToHeadTeamBIds}
+            onOpenTeamPage={(teamIds, teamName, snapshotId) => {
+              openTeamPage(teamIds, teamName, snapshotId);
+            }}
             onOpenHeadToHead={(role, teamId, snapshotId) => {
               pickHeadToHeadTeam(role, teamId, snapshotId);
               setTab('head-to-head');
             }}
           />
         ) : null}
+        {tab === 'teams' ? (
+          <TeamExplorer
+            selectedTeamId={selectedTeamProfileId}
+            selectedTeamIds={selectedTeamProfileIds}
+            selectedTeamName={selectedTeamProfileName}
+            selectedSnapshotId={selectedTeamProfileSnapshotId}
+            onOpenHeadToHead={(teamAIds, teamBIds, snapshotId) => {
+              openHeadToHeadPair(teamAIds, teamBIds, snapshotId);
+            }}
+            onOpenTeamPage={(teamIds, teamName, snapshotId) => {
+              openTeamPage(teamIds, teamName, snapshotId);
+            }}
+            onOpenPlayerLookup={(playerId, playerName) => {
+              openPlayerPage(playerId, playerName);
+            }}
+          />
+        ) : null}
         {tab === 'players' ? (
           <PlayerLookup
+            selectedPlayerId={selectedPlayerProfileId}
+            selectedPlayerName={selectedPlayerProfileName}
             onOpenTeamSearch={(teamName) => {
               setTab('search');
             }}

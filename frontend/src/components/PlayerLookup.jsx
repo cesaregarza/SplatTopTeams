@@ -1,7 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchPlayerSuggestions, fetchPlayerTeams } from '../api';
 
-export default function PlayerLookup({ onOpenTeamSearch }) {
+export default function PlayerLookup({
+  selectedPlayerId = '',
+  selectedPlayerName = '',
+  onOpenTeamSearch,
+}) {
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -60,6 +64,7 @@ export default function PlayerLookup({ onOpenTeamSearch }) {
     setSelectedPlayer(player);
     setQuery(player.display_name);
     setShowSuggestions(false);
+    setSuggestions([]);
     setLoading(true);
     setError('');
     setTeams([]);
@@ -73,6 +78,25 @@ export default function PlayerLookup({ onOpenTeamSearch }) {
       })
       .finally(() => setLoading(false));
   }
+
+  useEffect(() => {
+    const playerId = Number(selectedPlayerId);
+    if (!Number.isFinite(playerId) || playerId <= 0) return;
+
+    const nextName = String(selectedPlayerName || '').trim() || `Player ${Math.trunc(playerId)}`;
+    if (
+      selectedPlayer
+      && Number(selectedPlayer.player_id) === Math.trunc(playerId)
+      && String(selectedPlayer.display_name || '').trim() === nextName
+    ) {
+      return;
+    }
+
+    selectPlayer({
+      player_id: Math.trunc(playerId),
+      display_name: nextName,
+    });
+  }, [selectedPlayer, selectedPlayerId, selectedPlayerName]);
 
   const sortedTeams = useMemo(() => {
     const list = [...teams];
@@ -133,6 +157,7 @@ export default function PlayerLookup({ onOpenTeamSearch }) {
                   key={s.player_id}
                   className="suggestion-option"
                   role="option"
+                  aria-selected={Number(selectedPlayer?.player_id) === Number(s.player_id)}
                   tabIndex={0}
                   onClick={() => selectPlayer(s)}
                   onKeyDown={(e) => {

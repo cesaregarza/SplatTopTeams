@@ -1,7 +1,20 @@
 const API_BASE = import.meta.env.VITE_API_BASE || '';
+const TEAM_MATCHES_FALLBACK_BASE = import.meta.env.VITE_MATCHES_API_BASE
+  || (import.meta.env.DEV ? '/__splat_top_api' : 'https://splat.top');
+
+function buildRequestUrl(path, base = API_BASE) {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  return `${base}${path}`;
+}
 
 async function requestJson(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
+  return requestJsonWithBase(path, API_BASE, options);
+}
+
+async function requestJsonWithBase(path, base = API_BASE, options = {}) {
+  const response = await fetch(buildRequestUrl(path, base), {
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {}),
@@ -11,7 +24,11 @@ async function requestJson(path, options = {}) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    const error = new Error(text || `Request failed: ${response.status}`);
+    error.status = response.status;
+    error.responseText = text;
+    error.url = buildRequestUrl(path, base);
+    throw error;
   }
 
   return response.json();
@@ -213,11 +230,14 @@ export function fetchAnalyticsRosterOverlap({
   return requestJson(`/api/analytics/roster-overlap?${params.toString()}`);
 }
 
-export function fetchAnalyticsTeam({ teamId, clusterMode, neighbors = 12 }) {
+export function fetchAnalyticsTeam({ teamId, clusterMode, neighbors = 12, snapshotId } = {}) {
   const params = new URLSearchParams({
     cluster_mode: clusterMode,
     neighbors: String(neighbors),
   });
+  if (snapshotId) {
+    params.set('snapshot_id', String(snapshotId));
+  }
   return requestJson(`/api/analytics/team/${teamId}?${params.toString()}`);
 }
 
@@ -226,13 +246,65 @@ export function fetchAnalyticsTeamBlend({
   clusterMode,
   neighbors = 12,
   semanticWeight = 0.5,
-}) {
+  snapshotId,
+} = {}) {
   const params = new URLSearchParams({
     cluster_mode: clusterMode,
     neighbors: String(neighbors),
     semantic_weight: String(semanticWeight),
   });
+  if (snapshotId) {
+    params.set('snapshot_id', String(snapshotId));
+  }
   return requestJson(`/api/analytics/team/${teamId}/blend?${params.toString()}`);
+}
+
+export function fetchAnalyticsTeamMatches({
+  teamId,
+  teamIds,
+  limit = 25,
+  snapshotId,
+} = {}) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+  });
+
+  const normalizedTeamIds = (() => {
+    if (Array.isArray(teamIds)) {
+      return teamIds
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item) && item > 0)
+        .map((item) => Math.trunc(item));
+    }
+    if (typeof teamIds === 'string') {
+      return (teamIds.match(/\d+/g) || [])
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item) && item > 0)
+        .map((item) => Math.trunc(item));
+    }
+    return [];
+  })();
+
+  if (normalizedTeamIds.length > 0) {
+    params.set('team_ids', normalizedTeamIds.join(','));
+  }
+  if (snapshotId) {
+    params.set('snapshot_id', String(snapshotId));
+  }
+
+  const path = `/api/analytics/team/${teamId}/matches?${params.toString()}`;
+
+  return requestJson(path).catch((error) => {
+    const shouldRetryWithFallback = error?.status === 404
+      && TEAM_MATCHES_FALLBACK_BASE
+      && TEAM_MATCHES_FALLBACK_BASE !== API_BASE;
+
+    if (!shouldRetryWithFallback) {
+      throw error;
+    }
+
+    return requestJsonWithBase(path, TEAM_MATCHES_FALLBACK_BASE);
+  });
 }
 
 export function fetchAnalyticsOutliers({ clusterMode, limit = 30 }) {

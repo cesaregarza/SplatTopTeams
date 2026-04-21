@@ -4791,6 +4791,452 @@ class TeamSearchStore:
             "matches": matchups,
         }
 
+    def analytics_team_matches(
+        self,
+        *,
+        snapshot_id: int,
+        team_ids: Sequence[int],
+        limit: int,
+    ) -> Dict[str, Any]:
+        team_ids_sorted = _normalize_id_sequence(team_ids)
+        if not team_ids_sorted:
+            return {
+                "snapshot_id": snapshot_id,
+                "summary": {
+                    "primary_team_id": None,
+                    "primary_team_name": None,
+                    "team_ids": [],
+                    "team_names": [],
+                    "selected_team_count": 0,
+                    "total_matches": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "unresolved_matches": 0,
+                    "decided_matches": 0,
+                    "win_rate": 0.0,
+                    "tournaments": 0,
+                    "tournament_tier_distribution": {
+                        "X": 0,
+                        "S+": 0,
+                        "S": 0,
+                        "A+": 0,
+                        "A": 0,
+                        "A-": 0,
+                        "Unscored": 0,
+                    },
+                    "tournament_tier_match_distribution": {
+                        "X": 0,
+                        "S+": 0,
+                        "S": 0,
+                        "A+": 0,
+                        "A": 0,
+                        "A-": 0,
+                        "Unscored": 0,
+                    },
+                },
+                "matches": [],
+            }
+
+        primary_team_id = int(team_ids_sorted[0])
+        match_last_game = self._seconds_expr("m.last_game_finished_at_ms")
+        match_created = self._seconds_expr("m.created_at_ms")
+        tournament_start = self._seconds_expr("t.start_time_ms")
+        event_time_expr = f"COALESCE({match_last_game}, {match_created}, {tournament_start})"
+        event_time_expr_without_tournament = f"COALESCE({match_last_game}, {match_created})"
+
+        params: Dict[str, object] = {
+            "team_ids": team_ids_sorted,
+            "limit": max(1, int(limit)),
+        }
+
+        score_columns = self._resolve_match_score_columns()
+        if score_columns is not None:
+            score_col_a, score_col_b = score_columns
+            score_select = f"""
+                    CASE
+                        WHEN m.team1_id IN :team_ids THEN m.{score_col_a}
+                        ELSE m.{score_col_b}
+                      END AS team_score,
+                    CASE
+                        WHEN m.team1_id IN :team_ids THEN m.{score_col_b}
+                        ELSE m.{score_col_a}
+                      END AS opponent_score
+            """.strip()
+        else:
+            score_select = None
+
+        winner_score_select = "m.winner_team_id"
+        if score_select:
+            winner_score_select = f"""
+                {winner_score_select},
+                {score_select}
+            """.strip()
+
+        exclude_internal_alias_matches = ""
+        if len(team_ids_sorted) > 1:
+            exclude_internal_alias_matches = """
+                  AND NOT (m.team1_id IN :team_ids AND m.team2_id IN :team_ids)
+            """.rstrip()
+
+        def _safe_float(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _run_team_match_query() -> list[Dict[str, object]]:
+            sql_with_tournament_name = f"""
+                SELECT
+                    m.match_id,
+                    m.tournament_id,
+                    t.tournament_name,
+                    m.team1_id,
+                    m.team2_id,
+                    {winner_score_select}
+                    ,
+                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                    t.tags AS tournament_tags,
+                    {event_time_expr} AS event_time_ms
+                FROM {self.schema}.matches m
+                LEFT JOIN {self.schema}.tournaments t
+                  ON t.tournament_id = m.tournament_id
+                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+                  {exclude_internal_alias_matches}
+                ORDER BY {event_time_expr} DESC NULLS LAST
+                LIMIT :limit
+            """
+
+            sql_with_tournament_name_column = f"""
+                SELECT
+                    m.match_id,
+                    m.tournament_id,
+                    t.name AS tournament_name,
+                    m.team1_id,
+                    m.team2_id,
+                    {winner_score_select}
+                    ,
+                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                    t.tags AS tournament_tags,
+                    {event_time_expr} AS event_time_ms
+                FROM {self.schema}.matches m
+                LEFT JOIN {self.schema}.tournaments t
+                  ON t.tournament_id = m.tournament_id
+                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+                  {exclude_internal_alias_matches}
+                ORDER BY {event_time_expr} DESC NULLS LAST
+                LIMIT :limit
+            """
+
+            sql_without_tournament = f"""
+                SELECT
+                    m.match_id,
+                    m.tournament_id,
+                    NULL::text AS tournament_name,
+                    m.team1_id,
+                    m.team2_id,
+                    {winner_score_select}
+                    ,
+                    NULL::text AS tournament_mode,
+                    NULL::text AS map_picking_style,
+                    NULL::jsonb AS tournament_tags,
+                    {event_time_expr_without_tournament} AS event_time_ms
+                FROM {self.schema}.matches m
+                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+                  {exclude_internal_alias_matches}
+                ORDER BY {event_time_expr_without_tournament} DESC NULLS LAST
+                LIMIT :limit
+            """
+
+            query_results: list[Dict[str, object]] = []
+            for query in (
+                sql_with_tournament_name,
+                sql_with_tournament_name_column,
+                sql_without_tournament,
+            ):
+                try:
+                    with self.engine.connect() as conn:
+                        query_results = [
+                            dict(row)
+                            for row in conn.execute(
+                                text(query).bindparams(bindparam("team_ids", expanding=True)),
+                                params,
+                            ).mappings().all()
+                        ]
+                    break
+                except SQLAlchemyError as exc:
+                    if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
+                        raise
+
+            return query_results
+
+        rows = _run_team_match_query()
+
+        opponent_ids_sorted = sorted(
+            {
+                int(team_id)
+                for row in rows
+                for team_id in (row.get("team1_id"), row.get("team2_id"))
+                if team_id is not None and int(team_id) not in team_ids_sorted
+            }
+        )
+
+        match_rosters = self._fetch_match_rosters(
+            rows,
+            team_ids_sorted,
+            opponent_ids_sorted,
+        )
+        match_rounds = self._fetch_match_rounds(
+            rows,
+            team_ids_sorted,
+            opponent_ids_sorted,
+        )
+        tournament_scores = self._fetch_tournament_scores(
+            [
+                int(row["tournament_id"])
+                for row in rows
+                if row.get("tournament_id") is not None
+            ]
+        )
+
+        team_name_rows = []
+        name_lookup_ids = team_ids_sorted + opponent_ids_sorted
+        if snapshot_id is not None and name_lookup_ids:
+            try:
+                with self.engine.connect() as conn:
+                    team_name_rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT team_id, team_name
+                              FROM {self.schema}.team_search_embeddings
+                             WHERE snapshot_id = :snapshot_id
+                               AND team_id IN :team_ids
+                            """
+                        ).bindparams(bindparam("team_ids", expanding=True)),
+                        {
+                            "snapshot_id": int(snapshot_id),
+                            "team_ids": name_lookup_ids,
+                        },
+                    ).mappings().all()
+            except SQLAlchemyError as exc:
+                if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
+                    raise
+
+        team_names = {
+            int(row["team_id"]): str(row["team_name"])
+            for row in team_name_rows
+            if row is not None and row.get("team_id") is not None
+        }
+        selected_team_names = [
+            team_names.get(team_id, f"Team {team_id}")
+            for team_id in team_ids_sorted
+        ]
+
+        summary = {
+            "primary_team_id": primary_team_id,
+            "primary_team_name": selected_team_names[0] if selected_team_names else f"Team {primary_team_id}",
+            "team_ids": team_ids_sorted,
+            "team_names": selected_team_names,
+            "selected_team_count": len(team_ids_sorted),
+            "total_matches": 0,
+            "wins": 0,
+            "losses": 0,
+            "unresolved_matches": 0,
+            "decided_matches": 0,
+            "win_rate": 0.0,
+            "tournaments": 0,
+            "tournament_tier_distribution": {},
+            "tournament_tier_match_distribution": {},
+        }
+
+        tournaments_seen: set[int] = set()
+        tournaments_by_tier: Dict[str, int] = {}
+        matches_by_tier: Dict[str, int] = {}
+        tournament_tier_by_id: Dict[int, dict[str, str]] = {}
+        team_id_set = set(team_ids_sorted)
+        matches_out = []
+
+        for row in rows:
+            team1_id = int(row["team1_id"]) if row.get("team1_id") is not None else None
+            team2_id = int(row["team2_id"]) if row.get("team2_id") is not None else None
+
+            subject_team_id: Optional[int]
+            opponent_team_id: Optional[int]
+            if team1_id in team_id_set and team2_id not in team_id_set:
+                subject_team_id = team1_id
+                opponent_team_id = team2_id
+            elif team2_id in team_id_set and team1_id not in team_id_set:
+                subject_team_id = team2_id
+                opponent_team_id = team1_id
+            elif team1_id in team_id_set:
+                subject_team_id = team1_id
+                opponent_team_id = team2_id
+            elif team2_id in team_id_set:
+                subject_team_id = team2_id
+                opponent_team_id = team1_id
+            else:
+                continue
+
+            tournament_id = (
+                int(row["tournament_id"]) if row.get("tournament_id") is not None else None
+            )
+            winner_team_id = (
+                int(row["winner_team_id"]) if row.get("winner_team_id") is not None else None
+            )
+            team_score = _safe_float(row.get("team_score"))
+            opponent_score = _safe_float(row.get("opponent_score"))
+            roster_key = (int(row["match_id"]), tournament_id or 0)
+            roster = match_rosters.get(
+                roster_key,
+                {
+                    "team_a": {"player_ids": [], "player_names": []},
+                    "team_b": {"player_ids": [], "player_names": []},
+                },
+            )
+            team_roster_ids = list(roster.get("team_a", {}).get("player_ids", []))
+            team_roster_names = list(roster.get("team_a", {}).get("player_names", []))
+            opponent_roster_ids = list(roster.get("team_b", {}).get("player_ids", []))
+            opponent_roster_names = list(roster.get("team_b", {}).get("player_names", []))
+            match_round_rows = match_rounds.get(roster_key, [])
+
+            winner_side = None
+            if winner_team_id in team_id_set:
+                winner_side = "team"
+            elif opponent_team_id is not None and winner_team_id == opponent_team_id:
+                winner_side = "opponent"
+            elif (
+                team_score is not None
+                and opponent_score is not None
+                and team_score != opponent_score
+            ):
+                winner_side = "team" if team_score > opponent_score else "opponent"
+
+            if not match_round_rows and team_score is not None:
+                match_round_rows = [
+                    {
+                        "round_no": None,
+                        "maps_count": None,
+                        "map_index": 1,
+                        "map_name": None,
+                        "map_mode": None,
+                        "team_a_score": team_score,
+                        "team_b_score": opponent_score,
+                        "winner_team_id": winner_team_id,
+                        "winner_side": winner_side,
+                    }
+                ]
+
+            if winner_side == "team":
+                summary["wins"] += 1
+            elif winner_side == "opponent":
+                summary["losses"] += 1
+            else:
+                summary["unresolved_matches"] += 1
+
+            tournament_strength = tournament_scores.get(tournament_id)
+            tier = _tournament_tier(tournament_strength)
+            if tournament_id is not None:
+                tournaments_seen.add(tournament_id)
+                previous_tier = tournament_tier_by_id.get(int(tournament_id))
+                if previous_tier is None:
+                    tournaments_by_tier[tier["tier_id"]] = tournaments_by_tier.get(
+                        tier["tier_id"], 0
+                    ) + 1
+                    tournament_tier_by_id[int(tournament_id)] = tier
+                elif previous_tier["tier_id"] != tier["tier_id"]:
+                    tournaments_by_tier[previous_tier["tier_id"]] = max(
+                        0, tournaments_by_tier.get(previous_tier["tier_id"], 0) - 1
+                    )
+                    tournaments_by_tier[tier["tier_id"]] = tournaments_by_tier.get(
+                        tier["tier_id"], 0
+                    ) + 1
+                    tournament_tier_by_id[int(tournament_id)] = tier
+
+            matches_by_tier[tier["tier_id"]] = matches_by_tier.get(tier["tier_id"], 0) + 1
+
+            matches_out.append(
+                {
+                    "match_id": int(row["match_id"]),
+                    "team_id": subject_team_id,
+                    "team_name": team_names.get(subject_team_id, f"Team {subject_team_id}"),
+                    "opponent_team_id": opponent_team_id,
+                    "opponent_team_name": (
+                        team_names.get(opponent_team_id, f"Team {opponent_team_id}")
+                        if opponent_team_id is not None
+                        else "Unknown opponent"
+                    ),
+                    "tournament_id": tournament_id,
+                    "tournament_name": row.get("tournament_name"),
+                    "tournament_mode": row.get("tournament_mode"),
+                    "map_picking_style": row.get("map_picking_style"),
+                    "tournament_tags": row.get("tournament_tags"),
+                    "tournament_score": (
+                        None if tournament_strength is None else round(float(tournament_strength), 4)
+                    ),
+                    "tournament_score_tier_id": tier["tier_id"],
+                    "tournament_score_tier": tier["tier_label"],
+                    "winner_team_id": winner_team_id,
+                    "winner_side": winner_side,
+                    "team_score": team_score,
+                    "opponent_score": opponent_score,
+                    "team_roster": [
+                        {
+                            "player_id": player_id,
+                            "player_name": player_name,
+                        }
+                        for player_id, player_name in zip(team_roster_ids, team_roster_names)
+                    ],
+                    "opponent_roster": [
+                        {
+                            "player_id": player_id,
+                            "player_name": player_name,
+                        }
+                        for player_id, player_name in zip(opponent_roster_ids, opponent_roster_names)
+                    ],
+                    "event_time_ms": (
+                        int(row["event_time_ms"]) if row.get("event_time_ms") is not None else None
+                    ),
+                    "match_rounds": match_round_rows,
+                    "team_is_winner": bool(winner_side == "team"),
+                    "opponent_is_winner": bool(winner_side == "opponent"),
+                }
+            )
+
+        summary["total_matches"] = len(matches_out)
+        summary["tournaments"] = len(tournaments_seen)
+        summary["tournament_tier_distribution"] = {
+            "X": tournaments_by_tier.get("x", 0),
+            "S+": tournaments_by_tier.get("s_plus", 0),
+            "S": tournaments_by_tier.get("s", 0),
+            "A+": tournaments_by_tier.get("a_plus", 0),
+            "A": tournaments_by_tier.get("a", 0),
+            "A-": tournaments_by_tier.get("a_minus", 0),
+            "Unscored": tournaments_by_tier.get("unscored", 0),
+        }
+        summary["tournament_tier_match_distribution"] = {
+            "X": matches_by_tier.get("x", 0),
+            "S+": matches_by_tier.get("s_plus", 0),
+            "S": matches_by_tier.get("s", 0),
+            "A+": matches_by_tier.get("a_plus", 0),
+            "A": matches_by_tier.get("a", 0),
+            "A-": matches_by_tier.get("a_minus", 0),
+            "Unscored": matches_by_tier.get("unscored", 0),
+        }
+        if summary["total_matches"] > 0:
+            decided = summary["wins"] + summary["losses"]
+            summary["decided_matches"] = decided
+            if decided > 0:
+                summary["win_rate"] = round(summary["wins"] / decided, 4)
+
+        return {
+            "snapshot_id": snapshot_id,
+            "summary": summary,
+            "matches": matches_out,
+        }
+
     def analytics_roster_diversity(
         self,
         *,

@@ -1,5 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchTeamSearch, fetchTeamSuggestions, fetchTournamentTeams } from '../api';
+
+const EMPTY_TEAM_IDS = [];
 
 function fmtDate(ms) {
   const value = toEpochMs(ms);
@@ -238,9 +240,10 @@ function tournamentTeamDisplayName(team) {
 
 function tournamentTeamMeta(team) {
   const members = Array.isArray(team?.member_names)
-    ? team.member_names
-        .map((value) => String(value || '').trim())
-        .filter(Boolean)
+    ? team.member_names.flatMap((value) => {
+        const normalized = String(value || '').trim();
+        return normalized ? [normalized] : [];
+      })
     : [];
   const id = safeIntOrNull(team?.team_id);
   const pieces = [];
@@ -257,8 +260,9 @@ function tournamentTeamMeta(team) {
 export default function TeamSearch({
   selectedTeamAId = '',
   selectedTeamBId = '',
-  selectedTeamAIds = [],
-  selectedTeamBIds = [],
+  selectedTeamAIds = EMPTY_TEAM_IDS,
+  selectedTeamBIds = EMPTY_TEAM_IDS,
+  onOpenTeamPage = () => {},
   onOpenHeadToHead = () => {},
 }) {
   const [query, setQuery] = useState('');
@@ -286,6 +290,8 @@ export default function TeamSearch({
   const [visibleCount, setVisibleCount] = useState(20);
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const queryInputRef = useRef(null);
+  const suppressSuggestionsRef = useRef(false);
 
   const resultLabel = useMemo(() => {
     if (!payload) return 'No query yet.';
@@ -408,11 +414,19 @@ export default function TeamSearch({
           signal: controller.signal,
         });
         if (!controller.signal.aborted) {
-          setSuggestions(data.suggestions || []);
-          setShowSuggestions(true);
+          const nextSuggestions = data.suggestions || [];
+          setSuggestions(nextSuggestions);
+          setShowSuggestions(
+            !suppressSuggestionsRef.current
+              && document.activeElement === queryInputRef.current
+              && nextSuggestions.length > 0,
+          );
         }
       } catch {
-        if (!controller.signal.aborted) setSuggestions([]);
+        if (!controller.signal.aborted) {
+          setSuggestions([]);
+          setShowSuggestions(false);
+        }
       }
     }, 250);
     return () => {
@@ -487,6 +501,8 @@ export default function TeamSearch({
   async function onSubmit(event) {
     event.preventDefault();
     if (!query.trim()) return;
+    suppressSuggestionsRef.current = true;
+    setShowSuggestions(false);
     setLoading(true);
     setError('');
     try {
@@ -527,22 +543,25 @@ export default function TeamSearch({
           className="search-input-wrap"
           onBlur={(e) => {
             if (!e.currentTarget.contains(e.relatedTarget)) {
+              suppressSuggestionsRef.current = false;
               setTimeout(() => setShowSuggestions(false), 150);
             }
           }}
         >
           <input
             id="team-query"
+            ref={queryInputRef}
             className="input"
             type="search"
             placeholder="e.g. FTW, Moonlight, Hypernova"
             value={query}
             onChange={(e) => {
+              suppressSuggestionsRef.current = false;
               setQuery(e.target.value);
               clearSeedSelection();
             }}
             onFocus={() => {
-              if (suggestions.length) setShowSuggestions(true);
+              if (suggestions.length && !suppressSuggestionsRef.current) setShowSuggestions(true);
             }}
             autoComplete="off"
             role="combobox"
@@ -560,7 +579,9 @@ export default function TeamSearch({
                     className="suggestion-option"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => {
+                      suppressSuggestionsRef.current = true;
                       setQuery(s.team_name);
+                      clearSeedSelection();
                       setShowSuggestions(false);
                     }}
                   >
@@ -1022,6 +1043,14 @@ export default function TeamSearch({
                     </span>
                   </div>
                   <div className="bento-actions">
+                    <button
+                      type="button"
+                      className="result-select-btn"
+                      onClick={() => onOpenTeamPage(row.consolidated_team_ids || [row.team_id], teamDisplayName, payload?.snapshot_id)}
+                      title="Open this result on the Teams page"
+                    >
+                      Open team page
+                    </button>
                     <button
                       type="button"
                       className={`result-select-btn ${isTeamASelected ? 'is-selected' : ''}`}

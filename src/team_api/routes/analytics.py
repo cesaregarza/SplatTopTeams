@@ -23,6 +23,25 @@ def _resolve_snapshot_id(store: TeamSearchStore, snapshot_id: int | None) -> int
     return int(snapshot["run_id"])
 
 
+def _parse_team_ids(raw: str | None, fallback_id: int | None) -> list[int]:
+    tokens = re.findall(r"\d+", str(raw)) if raw else []
+    if tokens:
+        parsed: list[int] = []
+        seen = set()
+        for value in tokens:
+            team_id = int(value)
+            if team_id <= 0 or team_id in seen:
+                continue
+            seen.add(team_id)
+            parsed.append(team_id)
+        if parsed:
+            return parsed
+
+    if fallback_id is not None:
+        return [int(fallback_id)]
+    return []
+
+
 @router.get("/overview")
 def analytics_overview(
     snapshot_id: int | None = Query(default=None, ge=1),
@@ -69,24 +88,6 @@ def analytics_head_to_head(
     limit: int = Query(default=200, ge=1, le=1000),
     store: TeamSearchStore = Depends(get_store),
 ):
-    def _parse_team_ids(raw: str | None, fallback_id: int | None) -> list[int]:
-        tokens = re.findall(r"\d+", str(raw)) if raw else []
-        if tokens:
-            parsed: list[int] = []
-            seen = set()
-            for value in tokens:
-                team_id = int(value)
-                if team_id <= 0 or team_id in seen:
-                    continue
-                seen.add(team_id)
-                parsed.append(team_id)
-            if parsed:
-                return parsed
-
-        if fallback_id is not None:
-            return [int(fallback_id)]
-        return []
-
     parsed_team_a_ids = _parse_team_ids(team_a_ids, team_a_id)
     parsed_team_b_ids = _parse_team_ids(team_b_ids, team_b_id)
 
@@ -149,6 +150,27 @@ def analytics_team_lab(
     )
     if payload is None:
         raise HTTPException(status_code=404, detail="Team not found in snapshot")
+    return payload
+
+
+@router.get("/team/{team_id}/matches")
+def analytics_team_matches(
+    team_id: int,
+    team_ids: str | None = Query(default=None),
+    snapshot_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=25, ge=1, le=200),
+    store: TeamSearchStore = Depends(get_store),
+):
+    sid = _resolve_snapshot_id(store, snapshot_id)
+    parsed_team_ids = _parse_team_ids(team_ids, team_id)
+    if int(team_id) not in parsed_team_ids:
+        parsed_team_ids = [int(team_id), *parsed_team_ids]
+
+    payload = store.analytics_team_matches(
+        snapshot_id=sid,
+        team_ids=parsed_team_ids,
+        limit=limit,
+    )
     return payload
 
 

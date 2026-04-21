@@ -175,6 +175,108 @@ class FakeStore:
             limit=int(limit),
         )
 
+    def analytics_team_lab(self, snapshot_id, profile, team_id, neighbors):
+        if int(team_id) != 1:
+            return None
+        return {
+            "snapshot_id": snapshot_id,
+            "cluster_mode": profile,
+            "team": {
+                "team_id": 1,
+                "team_name": "Alpha",
+                "lineup_count": 10,
+                "distinct_lineup_count": 2,
+                "lineup_entropy": 0.4,
+                "top_lineup_share_pct": 60.0,
+                "effective_lineups": 1.5,
+                "volatility_score": 0.2,
+                "uniqueness_score": 0.1,
+                "cluster_id": 3,
+                "cluster_size": 5,
+            },
+            "neighbors": [
+                {
+                    "team_id": 2,
+                    "team_name": "Bravo",
+                    "sim_to_query": 0.9,
+                    "sim_semantic": 0.92,
+                    "sim_identity": 0.88,
+                    "identity_delta": -0.04,
+                    "cluster_id": 3,
+                }
+            ],
+            "match_summary": {
+                "matches": 3,
+                "wins": 2,
+                "win_rate": 0.6667,
+                "same_cluster_matches": 1,
+                "same_cluster_win_rate": 1.0,
+                "cross_cluster_matches": 2,
+                "cross_cluster_win_rate": 0.5,
+            },
+            "opponent_cluster_breakdown": [
+                {"cluster_id": 3, "matches": 1, "wins": 1, "win_rate": 1.0}
+            ],
+        }
+
+    def analytics_team_matches(self, snapshot_id, team_ids, limit):
+        return {
+            "snapshot_id": snapshot_id,
+            "summary": {
+                "primary_team_id": int(team_ids[0]),
+                "primary_team_name": "Alpha",
+                "team_ids": [int(team_id) for team_id in team_ids],
+                "team_names": ["Alpha", "Alpha Prime"][: len(team_ids)],
+                "selected_team_count": len(team_ids),
+                "total_matches": 1,
+                "wins": 1,
+                "losses": 0,
+                "unresolved_matches": 0,
+                "decided_matches": 1,
+                "win_rate": 1.0,
+                "tournaments": 1,
+                "tournament_tier_distribution": {
+                    "X": 0,
+                    "S+": 1,
+                    "S": 0,
+                    "A+": 0,
+                    "A": 0,
+                    "A-": 0,
+                    "Unscored": 0,
+                },
+                "tournament_tier_match_distribution": {
+                    "X": 0,
+                    "S+": 1,
+                    "S": 0,
+                    "A+": 0,
+                    "A": 0,
+                    "A-": 0,
+                    "Unscored": 0,
+                },
+            },
+            "matches": [
+                {
+                    "match_id": 77,
+                    "team_id": int(team_ids[0]),
+                    "team_name": "Alpha",
+                    "opponent_team_id": 2,
+                    "opponent_team_name": "Bravo",
+                    "tournament_id": 11,
+                    "tournament_name": "Summer Cup",
+                    "tournament_score_tier": "S+",
+                    "winner_side": "team",
+                    "team_score": 3.0,
+                    "opponent_score": 1.0,
+                    "team_roster": [{"player_id": 101, "player_name": "PlayerAlpha"}],
+                    "opponent_roster": [{"player_id": 201, "player_name": "PlayerBravo"}],
+                    "event_time_ms": 1000,
+                    "match_rounds": [],
+                    "team_is_winner": True,
+                    "opponent_is_winner": False,
+                }
+            ],
+        }
+
 
 def test_health_and_team_search_contracts():
     app.dependency_overrides[get_store] = lambda: FakeStore()
@@ -315,4 +417,21 @@ def test_player_teams_empty():
     payload = resp.json()
     assert payload["team_count"] == 0
     assert payload["teams"] == []
+    app.dependency_overrides.clear()
+
+
+def test_team_matches_endpoint_contract():
+    app.dependency_overrides[get_store] = lambda: FakeStore()
+    client = TestClient(app)
+    resp = client.get(
+        "/api/analytics/team/1/matches",
+        params={"team_ids": "1,3", "limit": 10},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["snapshot_id"] == 7
+    assert payload["summary"]["primary_team_id"] == 1
+    assert payload["summary"]["team_ids"] == [1, 3]
+    assert payload["summary"]["selected_team_count"] == 2
+    assert payload["matches"][0]["opponent_team_name"] == "Bravo"
     app.dependency_overrides.clear()
