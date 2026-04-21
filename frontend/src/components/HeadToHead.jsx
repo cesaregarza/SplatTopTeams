@@ -452,6 +452,7 @@ function summarizeTeamSet(ids, nameById, fallbackLabel) {
 }
 
 function clusterProfileCopy(mode) {
+  if (mode === 'family') return 'Family';
   if (mode === 'strict') return 'Strict';
   if (mode === 'explore') return 'Explore';
   return mode;
@@ -643,7 +644,7 @@ export default function HeadToHead({
   onSelectTeamB = () => {},
 }) {
   const [query, setQuery] = useState('');
-  const [clusterMode, setClusterMode] = useState('explore');
+  const [clusterMode, setClusterMode] = useState('family');
   const [topN, setTopN] = useState(20);
   const [minRelevance, setMinRelevance] = useState(0.8);
   const [consolidate, setConsolidate] = useState(true);
@@ -1141,6 +1142,7 @@ export default function HeadToHead({
                 value={clusterMode}
                 onChange={(event) => setClusterMode(event.target.value)}
               >
+                <option value="family">Family</option>
                 <option value="strict">Strict</option>
                 <option value="explore">Explore</option>
               </select>

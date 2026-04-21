@@ -9,6 +9,7 @@ from team_api.dependencies import get_store
 from team_api.store import TeamSearchStore
 
 router = APIRouter(prefix="/api", tags=["team-search"])
+ClusterMode = Literal["strict", "explore", "family"]
 
 
 @router.get("/team-search")
@@ -20,7 +21,7 @@ def team_search(
     seed_player_ids: list[int] = Query(default=[]),
     consolidate: bool = True,
     consolidate_min_overlap: float = Query(default=0.8, ge=0.0, le=1.0),
-    cluster_mode: Literal["strict", "explore"] = "strict",
+    cluster_mode: ClusterMode = "strict",
     include_clusters: bool = True,
     recency_weight: float = Query(default=0.0, ge=0.0, le=1.0),
     store: TeamSearchStore = Depends(get_store),

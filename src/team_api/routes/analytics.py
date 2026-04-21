@@ -9,6 +9,7 @@ from team_api.dependencies import get_store
 from team_api.store import TeamSearchStore
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+ClusterMode = Literal["strict", "explore", "family"]
 
 
 def _resolve_snapshot_id(store: TeamSearchStore, snapshot_id: int | None) -> int:
@@ -45,7 +46,7 @@ def _parse_team_ids(raw: str | None, fallback_id: int | None) -> list[int]:
 @router.get("/overview")
 def analytics_overview(
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     limit_clusters: int = Query(default=20, ge=1, le=100),
     volatile_limit: int = Query(default=15, ge=1, le=50),
     store: TeamSearchStore = Depends(get_store),
@@ -63,7 +64,7 @@ def analytics_overview(
 @router.get("/matchups")
 def analytics_matchups(
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     min_matches: int = Query(default=3, ge=1, le=100),
     limit: int = Query(default=30, ge=1, le=100),
     store: TeamSearchStore = Depends(get_store),
@@ -115,7 +116,7 @@ def analytics_head_to_head(
 @router.get("/roster-overlap")
 def analytics_roster_overlap(
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     min_similarity: float = Query(default=0.80, ge=0.0, le=1.0),
     max_player_overlap: float = Query(default=0.30, ge=0.0, le=1.0),
     min_cluster_size: int = Query(default=2, ge=2, le=200),
@@ -137,7 +138,7 @@ def analytics_roster_overlap(
 def analytics_team_lab(
     team_id: int,
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     neighbors: int = Query(default=12, ge=3, le=40),
     store: TeamSearchStore = Depends(get_store),
 ):
@@ -178,7 +179,7 @@ def analytics_team_matches(
 def analytics_team_blend(
     team_id: int,
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     semantic_weight: float = Query(default=0.5, ge=0.0, le=1.0),
     neighbors: int = Query(default=12, ge=3, le=40),
     store: TeamSearchStore = Depends(get_store),
@@ -199,7 +200,7 @@ def analytics_team_blend(
 @router.get("/outliers")
 def analytics_outliers(
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     limit: int = Query(default=30, ge=1, le=200),
     store: TeamSearchStore = Depends(get_store),
 ):
@@ -214,7 +215,7 @@ def analytics_outliers(
 @router.get("/space")
 def analytics_space(
     snapshot_id: int | None = Query(default=None, ge=1),
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     max_points: int = Query(default=800, ge=50, le=3000),
     store: TeamSearchStore = Depends(get_store),
 ):
@@ -228,7 +229,7 @@ def analytics_space(
 
 @router.get("/drift")
 def analytics_drift(
-    cluster_mode: Literal["strict", "explore"] = "explore",
+    cluster_mode: ClusterMode = "explore",
     current_snapshot_id: int | None = Query(default=None, ge=1),
     previous_snapshot_id: int | None = Query(default=None, ge=1),
     top_movers: int = Query(default=20, ge=1, le=100),

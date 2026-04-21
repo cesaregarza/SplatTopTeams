@@ -295,6 +295,17 @@ def test_health_and_team_search_contracts():
     app.dependency_overrides.clear()
 
 
+def test_team_search_accepts_family_cluster_mode():
+    app.dependency_overrides[get_store] = lambda: FakeStore()
+    client = TestClient(app)
+
+    resp = client.get("/api/team-search", params={"q": "alp", "cluster_mode": "family"})
+    assert resp.status_code == 200
+    assert resp.json()["cluster_mode"] == "family"
+
+    app.dependency_overrides.clear()
+
+
 def test_cluster_detail_404():
     app.dependency_overrides[get_store] = lambda: FakeStore()
     client = TestClient(app)

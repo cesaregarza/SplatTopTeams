@@ -225,6 +225,7 @@ export default function AdvancedAnalytics() {
             value={clusterMode}
             onChange={(e) => setClusterMode(e.target.value)}
           >
+            <option value="family">family</option>
             <option value="strict">strict</option>
             <option value="explore">explore</option>
           </select>

@@ -266,7 +266,7 @@ export default function TeamSearch({
   onOpenHeadToHead = () => {},
 }) {
   const [query, setQuery] = useState('');
-  const [clusterMode, setClusterMode] = useState('explore');
+  const [clusterMode, setClusterMode] = useState('family');
   const [topN, setTopN] = useState(20);
   const [minRelevance, setMinRelevance] = useState(0.8);
   const [consolidate, setConsolidate] = useState(true);
@@ -711,6 +711,7 @@ export default function TeamSearch({
               value={clusterMode}
               onChange={(e) => setClusterMode(e.target.value)}
             >
+              <option value="family">family</option>
               <option value="strict">strict</option>
               <option value="explore">explore</option>
             </select>

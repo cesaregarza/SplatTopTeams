@@ -2,6 +2,39 @@ const API_BASE = import.meta.env.VITE_API_BASE || '';
 const TEAM_MATCHES_FALLBACK_BASE = import.meta.env.VITE_MATCHES_API_BASE
   || (import.meta.env.DEV ? '/__splat_top_api' : 'https://splat.top');
 
+function replaceFamilyClusterMode(path) {
+  const queryStart = path.indexOf('?');
+  if (queryStart < 0) return null;
+
+  const pathname = path.slice(0, queryStart);
+  const search = path.slice(queryStart + 1);
+  const params = new URLSearchParams(search);
+  if (params.get('cluster_mode') !== 'family') return null;
+
+  params.set('cluster_mode', 'explore');
+  return `${pathname}?${params.toString()}`;
+}
+
+function isUnsupportedFamilyClusterModeError(status, text) {
+  if (status !== 422 || !text) return false;
+
+  try {
+    const payload = JSON.parse(text);
+    const details = Array.isArray(payload?.detail) ? payload.detail : [];
+    return details.some((detail) => (
+      detail?.type === 'literal_error'
+      && Array.isArray(detail?.loc)
+      && detail.loc[0] === 'query'
+      && detail.loc[1] === 'cluster_mode'
+      && typeof detail?.ctx?.expected === 'string'
+      && detail.ctx.expected.includes("'strict'")
+      && detail.ctx.expected.includes("'explore'")
+    ));
+  } catch {
+    return false;
+  }
+}
+
 function buildRequestUrl(path, base = API_BASE) {
   if (/^https?:\/\//i.test(path)) {
     return path;
@@ -24,6 +57,11 @@ async function requestJsonWithBase(path, base = API_BASE, options = {}) {
 
   if (!response.ok) {
     const text = await response.text();
+    const fallbackPath = replaceFamilyClusterMode(path);
+    if (fallbackPath && isUnsupportedFamilyClusterModeError(response.status, text)) {
+      return requestJsonWithBase(fallbackPath, base, options);
+    }
+
     const error = new Error(text || `Request failed: ${response.status}`);
     error.status = response.status;
     error.responseText = text;

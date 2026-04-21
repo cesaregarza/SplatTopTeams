@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchAnalyticsTeam, fetchAnalyticsTeamMatches, fetchTeamSearch } from '../api';
 
-const DEFAULT_CLUSTER_MODE = 'explore';
+const DEFAULT_CLUSTER_MODE = 'family';
 const DEFAULT_NEIGHBORS = 12;
 const DEFAULT_MATCH_LIMIT = 25;
 

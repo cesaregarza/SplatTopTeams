@@ -6,6 +6,7 @@ import json
 import math
 import logging
 import os
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -25,8 +26,14 @@ from shared_lib.team_vector_utils import (
     unordered_player_pairs,
 )
 from team_api.sql import get_vector_column_info, ensure_search_tables, validate_identifier
+from team_api.family_clustering import cluster_rows_consolidation_graph
+from team_api.store import EmbeddingRow
 
 logger = logging.getLogger(__name__)
+
+_FAMILY_NAME_BRACKETED_RE = re.compile(r"[\(\[].*?[\)\]]")
+_FAMILY_NAME_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_FAMILY_NAME_SPACES_RE = re.compile(r"\s+")
 
 
 def _is_permission_denied(exc: Exception) -> bool:
@@ -36,6 +43,102 @@ def _is_permission_denied(exc: Exception) -> bool:
 
 def _vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(f"{float(v):.10g}" for v in vector) + "]"
+
+
+def _normalize_family_name_bucket(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = _FAMILY_NAME_BRACKETED_RE.sub(" ", text)
+    text = _FAMILY_NAME_NON_ALNUM_RE.sub(" ", text)
+    return _FAMILY_NAME_SPACES_RE.sub(" ", text).strip()
+
+
+def _family_name_qualifier_penalty(value: str) -> int:
+    text = str(value or "").strip()
+    penalty = 0
+    if _FAMILY_NAME_BRACKETED_RE.search(text):
+        penalty += 2
+    if re.search(r"\s[-:/|]\s", text):
+        penalty += 1
+    return penalty
+
+
+def _family_name_casing_penalty(value: str) -> int:
+    letters = "".join(ch for ch in str(value or "") if ch.isalpha())
+    if len(letters) >= 4 and letters.isupper():
+        return 1
+    return 0
+
+
+def _representative_cluster_name(
+    profile: str,
+    member_payloads: Sequence[TeamPayload],
+) -> str | None:
+    if not member_payloads:
+        return None
+
+    exact_name_weights: Dict[str, int] = {}
+    for payload in member_payloads:
+        candidate = str(payload.team_name or "").strip() or f"Team {int(payload.team_id)}"
+        exact_name_weights[candidate] = (
+            int(exact_name_weights.get(candidate, 0)) + int(payload.lineup_count)
+        )
+
+    if profile != "family":
+        return sorted(
+            exact_name_weights.items(),
+            key=lambda item: (-int(item[1]), item[0].lower()),
+        )[0][0]
+
+    bucket_weights: Dict[str, int] = {}
+    bucket_latest: Dict[str, int] = {}
+    exact_name_latest: Dict[str, int] = {}
+    bucket_exact_names: Dict[str, Dict[str, int]] = defaultdict(dict)
+
+    for payload in member_payloads:
+        candidate = str(payload.team_name or "").strip() or f"Team {int(payload.team_id)}"
+        bucket = _normalize_family_name_bucket(candidate) or candidate.lower()
+        weight = int(payload.lineup_count)
+        latest = int(payload.event_time_ms or 0)
+
+        bucket_weights[bucket] = int(bucket_weights.get(bucket, 0)) + weight
+        bucket_latest[bucket] = max(int(bucket_latest.get(bucket, 0)), latest)
+        exact_name_latest[candidate] = max(int(exact_name_latest.get(candidate, 0)), latest)
+        bucket_exact_names.setdefault(bucket, {})
+        bucket_exact_names[bucket][candidate] = (
+            int(bucket_exact_names[bucket].get(candidate, 0)) + weight
+        )
+
+    winning_bucket = sorted(
+        bucket_weights,
+        key=lambda bucket: (
+            -int(bucket_weights[bucket]),
+            -int(bucket_latest.get(bucket, 0)),
+            bucket,
+        ),
+    )[0]
+
+    winning_exact_names = bucket_exact_names[winning_bucket]
+    max_exact_weight = max(int(weight) for weight in winning_exact_names.values())
+    min_clean_weight = max(1, int(math.ceil(float(max_exact_weight) * 0.4)))
+    eligible_exact_names = [
+        name
+        for name, weight in winning_exact_names.items()
+        if int(weight) >= min_clean_weight
+    ] or list(winning_exact_names)
+
+    return sorted(
+        eligible_exact_names,
+        key=lambda name: (
+            _family_name_qualifier_penalty(name),
+            _family_name_casing_penalty(name),
+            -int(winning_exact_names[name]),
+            -int(exact_name_latest.get(name, 0)),
+            len(name),
+            name.lower(),
+        ),
+    )[0]
 
 
 @dataclass
@@ -513,6 +616,43 @@ def _greedy_clusters(
     return cluster_map
 
 
+def _payload_to_embedding_row(payload: TeamPayload) -> EmbeddingRow:
+    return EmbeddingRow(
+        team_id=int(payload.team_id),
+        tournament_id=payload.tournament_id,
+        team_name=payload.team_name,
+        event_time_ms=payload.event_time_ms,
+        lineup_count=int(payload.lineup_count),
+        semantic_vector=payload.semantic_vector,
+        identity_vector=payload.identity_vector,
+        final_vector=payload.final_vector,
+        top_lineup_summary=payload.top_lineup_summary,
+        unique_player_count=int(payload.unique_player_count),
+        distinct_lineup_count=int(payload.distinct_lineup_count),
+        top_lineup_share=float(payload.top_lineup_share),
+        lineup_entropy=float(payload.lineup_entropy),
+        effective_lineups=float(payload.effective_lineups),
+        top_lineup_player_ids=tuple(int(part) for part in payload.top_lineup_player_ids),
+        top_lineup_player_names=tuple(payload.top_lineup_player_names),
+        roster_player_ids=tuple(int(part) for part in payload.roster_player_ids),
+        roster_player_names=tuple(payload.roster_player_names),
+        roster_player_match_counts=tuple(int(part) for part in payload.roster_player_match_counts),
+        player_support={
+            int(player_id): float(support)
+            for player_id, support in payload.player_support.items()
+        },
+        pair_support={
+            tuple(int(part) for part in key.split("|", 1)): float(support)
+            for key, support in payload.pair_support.items()
+        },
+        lineup_variant_counts={
+            tuple(int(part) for part in key.split("|")): int(count)
+            for key, count in payload.lineup_variant_counts.items()
+        },
+        tournament_count=int(payload.tournament_count),
+    )
+
+
 def _start_run(
     db_url: str,
     schema: str,
@@ -609,6 +749,7 @@ def _persist_snapshot(
     payloads: Sequence[TeamPayload],
     strict_clusters: Dict[int, Dict[str, int]],
     explore_clusters: Dict[int, Dict[str, int]],
+    family_clusters: Dict[int, Dict[str, int]],
     final_vector_dim: int,
 ) -> None:
     engine = create_engine(db_url)
@@ -791,13 +932,16 @@ def _persist_snapshot(
     ) -> List[Dict[str, object]]:
         rows: List[Dict[str, object]] = []
 
-        rep_name_by_cluster: Dict[int, str] = {}
+        payloads_by_cluster: Dict[int, List[TeamPayload]] = defaultdict(list)
         for team_id, info in cluster_map.items():
             cid = int(info["cluster_id"])
-            current = rep_name_by_cluster.get(cid)
-            candidate = payload_lookup[team_id].team_name
-            if current is None:
-                rep_name_by_cluster[cid] = candidate
+            payloads_by_cluster[cid].append(payload_lookup[team_id])
+
+        rep_name_by_cluster: Dict[int, str] = {}
+        for cid, member_payloads in payloads_by_cluster.items():
+            representative = _representative_cluster_name(profile, member_payloads)
+            if representative:
+                rep_name_by_cluster[cid] = representative
 
         for team_id, info in cluster_map.items():
             cid = int(info["cluster_id"])
@@ -816,6 +960,7 @@ def _persist_snapshot(
     payload_lookup = {payload.team_id: payload for payload in payloads}
     cluster_rows = _cluster_rows("strict", strict_clusters, payload_lookup)
     cluster_rows.extend(_cluster_rows("explore", explore_clusters, payload_lookup))
+    cluster_rows.extend(_cluster_rows("family", family_clusters, payload_lookup))
 
     insert_clusters_sql = f"""
         INSERT INTO {schema}.team_search_clusters (
@@ -892,6 +1037,7 @@ def run_refresh(
     strict_threshold: float,
     explore_threshold: float,
     keep_runs: int,
+    family_min_overlap: float = 0.72,
 ) -> int:
     schema = validate_identifier(schema)
     engine = create_engine(target_db_url)
@@ -1013,6 +1159,11 @@ def run_refresh(
             min_cluster_size=2,
             max_teams=max_cluster_teams,
         )
+        family_clusters = cluster_rows_consolidation_graph(
+            [_payload_to_embedding_row(payload) for payload in payloads],
+            min_overlap=float(family_min_overlap),
+            min_cluster_size=2,
+        )
 
         _persist_snapshot(
             target_db_url,
@@ -1022,6 +1173,7 @@ def run_refresh(
             payloads,
             strict_clusters,
             explore_clusters,
+            family_clusters,
             final_vector_dim=final_vector_dim,
         )
 
@@ -1084,6 +1236,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cluster-teams", type=int, default=2500)
     parser.add_argument("--strict-threshold", type=float, default=0.94)
     parser.add_argument("--explore-threshold", type=float, default=0.90)
+    parser.add_argument("--family-min-overlap", type=float, default=0.72)
     parser.add_argument("--keep-runs", type=int, default=5)
     return parser
 
@@ -1129,6 +1282,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_cluster_teams=int(args.max_cluster_teams),
         strict_threshold=float(args.strict_threshold),
         explore_threshold=float(args.explore_threshold),
+        family_min_overlap=float(args.family_min_overlap),
         keep_runs=int(args.keep_runs),
     )
     print(f"Refresh run complete. run_id={run_id}")
