@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAnalyticsTeam, fetchAnalyticsTeamMatches, fetchTeamSearch } from '../api';
 
 const DEFAULT_CLUSTER_MODE = 'family';
 const DEFAULT_NEIGHBORS = 12;
 const DEFAULT_MATCH_LIMIT = 25;
+const DEFAULT_TEAM_SCOPE = 'family';
 
 function parseTeamIdList(value) {
   if (Array.isArray(value)) {
@@ -33,6 +34,14 @@ function uniqueTeamIds(values) {
     out.push(value);
   }
   return out;
+}
+
+function sameTeamIds(left, right) {
+  const normalizedLeft = uniqueTeamIds(parseTeamIdList(left));
+  const normalizedRight = uniqueTeamIds(parseTeamIdList(right));
+  if (normalizedLeft.length !== normalizedRight.length) return false;
+  const rightSet = new Set(normalizedRight);
+  return normalizedLeft.every((value) => rightSet.has(value));
 }
 
 function pct(value) {
@@ -161,6 +170,25 @@ function buildRecentForm(matches, limit = 5) {
   }));
 }
 
+function resolveTeamProfileRow(rows, teamIds) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  return rows.find((row) => rowMatchesSelectedTeam(row, teamIds))
+    || rows.find((row) => Number(row?.team_id) === Number(teamIds[0]))
+    || rows[0]
+    || null;
+}
+
+function resolveScopedTeamIds(requestedIds, matchedRow, scopeMode) {
+  const normalizedRequestedIds = uniqueTeamIds(parseTeamIdList(requestedIds));
+  if (scopeMode !== 'family') return normalizedRequestedIds;
+
+  const familyIds = uniqueTeamIds([
+    Number(matchedRow?.team_id),
+    ...parseTeamIdList(matchedRow?.consolidated_team_ids),
+  ]);
+  return familyIds.length ? familyIds : normalizedRequestedIds;
+}
+
 export default function TeamExplorer({
   selectedTeamId = '',
   selectedTeamIds = [],
@@ -171,12 +199,15 @@ export default function TeamExplorer({
   onOpenPlayerLookup = () => {},
 }) {
   const [teamIdsInput, setTeamIdsInput] = useState('');
+  const [teamScope, setTeamScope] = useState(DEFAULT_TEAM_SCOPE);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [teamLab, setTeamLab] = useState(null);
   const [teamProfile, setTeamProfile] = useState(null);
   const [matchHistory, setMatchHistory] = useState(null);
   const [matchHistoryError, setMatchHistoryError] = useState('');
+  const [resolvedTeamIds, setResolvedTeamIds] = useState([]);
+  const previousScopeRef = useRef(DEFAULT_TEAM_SCOPE);
 
   const selectedIds = useMemo(
     () => uniqueTeamIds([
@@ -189,36 +220,33 @@ export default function TeamExplorer({
   const normalizedSelectedSnapshotId = selectedSnapshotId ? String(selectedSnapshotId) : '';
 
   const loadTeam = useCallback(async (nextTeamIds, snapshotId = normalizedSelectedSnapshotId) => {
-    const normalizedIds = uniqueTeamIds(parseTeamIdList(nextTeamIds));
-    if (!normalizedIds.length) {
+    const requestedIds = uniqueTeamIds(parseTeamIdList(nextTeamIds));
+    if (!requestedIds.length) {
       setError('Enter at least one valid team ID.');
       setTeamLab(null);
+      setTeamProfile(null);
       setMatchHistory(null);
+      setResolvedTeamIds([]);
       return;
     }
 
-    const primaryTeamId = normalizedIds[0];
+    const primaryTeamId = requestedIds[0];
 
     setLoading(true);
     setError('');
     setMatchHistoryError('');
+    setResolvedTeamIds(requestedIds);
     try {
-      const [teamPayload, matchesPayload, searchPayload] = await Promise.allSettled([
+      const [teamPayload, searchPayload] = await Promise.allSettled([
         fetchAnalyticsTeam({
           teamId: primaryTeamId,
           clusterMode: DEFAULT_CLUSTER_MODE,
           neighbors: DEFAULT_NEIGHBORS,
           snapshotId: snapshotId || undefined,
         }),
-        fetchAnalyticsTeamMatches({
-          teamId: primaryTeamId,
-          teamIds: normalizedIds,
-          limit: DEFAULT_MATCH_LIMIT,
-          snapshotId: snapshotId || undefined,
-        }),
         fetchTeamSearch({
           q: String(primaryTeamId),
-          topN: 6,
+          topN: 12,
           clusterMode: DEFAULT_CLUSTER_MODE,
           minRelevance: 0,
           consolidate: true,
@@ -231,39 +259,65 @@ export default function TeamExplorer({
 
       setTeamLab(teamPayload.value);
 
+      let matchedRow = null;
       if (searchPayload.status === 'fulfilled') {
         const searchRows = searchPayload.value?.results || [];
-        const matchedRow = searchRows.find((row) => rowMatchesSelectedTeam(row, normalizedIds)) || null;
+        matchedRow = resolveTeamProfileRow(searchRows, requestedIds);
         setTeamProfile(matchedRow || searchRows[0] || null);
       } else {
         setTeamProfile(null);
       }
 
-      if (matchesPayload.status === 'fulfilled') {
-        setMatchHistory(matchesPayload.value);
-      } else {
+      const effectiveIds = resolveScopedTeamIds(requestedIds, matchedRow, teamScope);
+      setResolvedTeamIds(effectiveIds);
+
+      try {
+        const matchesPayload = await fetchAnalyticsTeamMatches({
+          teamId: primaryTeamId,
+          teamIds: effectiveIds,
+          limit: DEFAULT_MATCH_LIMIT,
+          snapshotId: snapshotId || undefined,
+        });
+        setMatchHistory(matchesPayload);
+      } catch (_matchesError) {
         setMatchHistory(null);
         setMatchHistoryError('Recent matches are unavailable right now.');
       }
+
     } catch (err) {
       setTeamLab(null);
       setTeamProfile(null);
       setMatchHistory(null);
       setMatchHistoryError('');
+      setResolvedTeamIds([]);
       setError(err.message || 'Failed to load team detail');
     } finally {
       setLoading(false);
     }
-  }, [normalizedSelectedSnapshotId]);
+  }, [normalizedSelectedSnapshotId, teamScope]);
 
   useEffect(() => {
     if (!selectedIds.length) return;
     setTeamIdsInput(selectedIds.join(','));
     loadTeam(selectedIds, normalizedSelectedSnapshotId);
-  }, [loadTeam, normalizedSelectedSnapshotId, selectedIds, selectedIdsKey]);
+    // Intentionally exclude loadTeam so scope toggles do not overwrite manual ID edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [normalizedSelectedSnapshotId, selectedIds, selectedIdsKey]);
+
+  useEffect(() => {
+    if (previousScopeRef.current === teamScope) return;
+    previousScopeRef.current = teamScope;
+    const idsToReload = uniqueTeamIds(parseTeamIdList(teamIdsInput));
+    if (!idsToReload.length) return;
+    loadTeam(idsToReload, normalizedSelectedSnapshotId);
+  }, [loadTeam, normalizedSelectedSnapshotId, teamIdsInput, teamScope]);
 
   const summary = matchHistory?.summary || null;
   const team = teamLab?.team || null;
+  const enteredIds = useMemo(
+    () => uniqueTeamIds(parseTeamIdList(teamIdsInput)),
+    [teamIdsInput],
+  );
   const teamProfilePlayers = useMemo(
     () => normalizePlayerRows(teamProfile?.core_lineup_players || teamProfile?.top_lineup_players || []),
     [teamProfile],
@@ -276,7 +330,7 @@ export default function TeamExplorer({
   const matches = matchHistory?.matches || [];
   const fallbackSummary = useMemo(() => {
     if (!teamLab?.team) return null;
-    const familyIds = selectedIds.length ? selectedIds : [teamLab.team.team_id];
+    const familyIds = resolvedTeamIds.length ? resolvedTeamIds : selectedIds.length ? selectedIds : [teamLab.team.team_id];
     const familyNames = familyIds.map((teamId) => {
       if (teamId === teamLab.team.team_id) return teamLab.team.team_name;
       return `Team ${teamId}`;
@@ -304,13 +358,18 @@ export default function TeamExplorer({
       tournament_tier_distribution: null,
       tournament_tier_match_distribution: null,
     };
-  }, [selectedIds, teamLab]);
+  }, [resolvedTeamIds, selectedIds, teamLab]);
   const effectiveSummary = summary || fallbackSummary;
   const pageTitle = effectiveSummary?.primary_team_name
     || team?.team_name
     || String(selectedTeamName || '').trim()
     || (selectedIds[0] ? `Team ${selectedIds[0]}` : 'Teams');
-  const selectedFamilyIds = effectiveSummary?.team_ids || selectedIds;
+  const selectedFamilyIds = useMemo(() => {
+    const summaryIds = uniqueTeamIds(parseTeamIdList(effectiveSummary?.team_ids));
+    if (summaryIds.length) return summaryIds;
+    if (resolvedTeamIds.length) return resolvedTeamIds;
+    return selectedIds;
+  }, [effectiveSummary?.team_ids, resolvedTeamIds, selectedIds]);
   const playerBaselineMatches = Number(teamProfile?.match_count ?? effectiveSummary?.total_matches ?? teamLab?.match_summary?.matches ?? 0);
   const primaryMatchCount = Number(teamProfile?.match_count ?? effectiveSummary?.total_matches ?? teamLab?.match_summary?.matches ?? 0);
   const tournamentCount = Number(teamProfile?.tournament_count ?? effectiveSummary?.tournaments ?? 0);
@@ -358,6 +417,18 @@ export default function TeamExplorer({
     return `${bits.join(' ')}. ${continuity}`.trim();
   }, [continuityHint, pageTitle, primaryMatchCount, topLineupShare, tournamentCount, uniquePlayerCount]);
   const recentForm = useMemo(() => buildRecentForm(matches), [matches]);
+  const scopeSummary = useMemo(() => {
+    if (!selectedFamilyIds.length) return '';
+
+    if (teamScope === 'family') {
+      if (enteredIds.length && !sameTeamIds(enteredIds, selectedFamilyIds)) {
+        return `Family mode expanded ${enteredIds[0]} into ${selectedFamilyIds.length} related registrations.`;
+      }
+      return `Family mode is using ${selectedFamilyIds.length} registration${selectedFamilyIds.length === 1 ? '' : 's'} together.`;
+    }
+
+    return `Individual mode is using exactly ${selectedFamilyIds.length} ID${selectedFamilyIds.length === 1 ? '' : 's'}.`;
+  }, [enteredIds, selectedFamilyIds, teamScope]);
 
   async function onSubmit(event) {
     event.preventDefault();
@@ -389,8 +460,22 @@ export default function TeamExplorer({
             onChange={(event) => setTeamIdsInput(event.target.value)}
           />
           <span className="field-label-subtitle">
-            Multiple IDs let you inspect a saved family or merged registration history together.
+            {teamScope === 'family'
+              ? 'Family mode expands the first team ID into the full resolved family when available.'
+              : 'Individual mode uses exactly the IDs entered here.'}
           </span>
+        </div>
+        <div className="field">
+          <label className="field-label" htmlFor="team-detail-scope">Scope</label>
+          <select
+            id="team-detail-scope"
+            className="input"
+            value={teamScope}
+            onChange={(event) => setTeamScope(event.target.value)}
+          >
+            <option value="family">Full family</option>
+            <option value="individual">Individual ID only</option>
+          </select>
         </div>
         <button type="submit" className="button btn-pill btn-fuchsia" disabled={loading}>
           {loading ? 'Loading…' : 'Load team'}
@@ -410,6 +495,9 @@ export default function TeamExplorer({
 
       {team || effectiveSummary ? (
         <>
+          {scopeSummary ? (
+            <p className="meta">{scopeSummary}</p>
+          ) : null}
           {teamSummaryLine ? (
             <p className="team-analyst-summary">{teamSummaryLine}</p>
           ) : null}
