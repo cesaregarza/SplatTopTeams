@@ -288,6 +288,22 @@ function teamAliasRowKey(parentTeamId, team) {
   return `alias:${parentTeamId}:${teamName}:${matchCount}:${tournamentId}:${eventTime}`;
 }
 
+function hasNonDefaultAdvancedSearchState(state) {
+  const normalized = normalizeSearchRouteState(state);
+  return (
+    normalized.clusterMode !== DEFAULT_SEARCH_ROUTE_STATE.clusterMode
+    || normalized.topN !== DEFAULT_SEARCH_ROUTE_STATE.topN
+    || normalized.minRelevance !== DEFAULT_SEARCH_ROUTE_STATE.minRelevance
+    || normalized.consolidate !== DEFAULT_SEARCH_ROUTE_STATE.consolidate
+    || normalized.consolidateMinOverlap !== DEFAULT_SEARCH_ROUTE_STATE.consolidateMinOverlap
+    || normalized.recencyWeight !== DEFAULT_SEARCH_ROUTE_STATE.recencyWeight
+    || normalized.tournamentId !== DEFAULT_SEARCH_ROUTE_STATE.tournamentId
+    || normalized.seedPlayerIds.length > 0
+    || normalized.seedTeamId !== DEFAULT_SEARCH_ROUTE_STATE.seedTeamId
+    || normalized.seedTeamName !== DEFAULT_SEARCH_ROUTE_STATE.seedTeamName
+  );
+}
+
 export default function TeamSearch({
   selectedTeamAId = '',
   selectedTeamBId = '',
@@ -301,12 +317,12 @@ export default function TeamSearch({
   onOpenHeadToHeadPage = () => {},
 }) {
   const [query, setQuery] = useState('');
-  const [clusterMode, setClusterMode] = useState('family');
-  const [topN, setTopN] = useState(20);
-  const [minRelevance, setMinRelevance] = useState(0.8);
-  const [consolidate, setConsolidate] = useState(true);
-  const [consolidateMinOverlap, setConsolidateMinOverlap] = useState(0.8);
-  const [recencyWeight, setRecencyWeight] = useState(0);
+  const [clusterMode, setClusterMode] = useState(DEFAULT_SEARCH_ROUTE_STATE.clusterMode);
+  const [topN, setTopN] = useState(DEFAULT_SEARCH_ROUTE_STATE.topN);
+  const [minRelevance, setMinRelevance] = useState(DEFAULT_SEARCH_ROUTE_STATE.minRelevance);
+  const [consolidate, setConsolidate] = useState(DEFAULT_SEARCH_ROUTE_STATE.consolidate);
+  const [consolidateMinOverlap, setConsolidateMinOverlap] = useState(DEFAULT_SEARCH_ROUTE_STATE.consolidateMinOverlap);
+  const [recencyWeight, setRecencyWeight] = useState(DEFAULT_SEARCH_ROUTE_STATE.recencyWeight);
   const [tournamentId, setTournamentId] = useState('');
   const [tournamentTeamLookup, setTournamentTeamLookup] = useState('');
   const [selectedTournamentSeedMeta, setSelectedTournamentSeedMeta] = useState(null);
@@ -325,7 +341,9 @@ export default function TeamSearch({
   const [visibleCount, setVisibleCount] = useState(20);
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false);
   const queryInputRef = useRef(null);
+  const advancedPopoverRef = useRef(null);
   const suppressSuggestionsRef = useRef(false);
   const hydratedRouteSignatureRef = useRef('');
 
@@ -393,6 +411,32 @@ export default function TeamSearch({
     () => normalizeSearchRouteState(initialRouteState),
     [initialRouteState],
   );
+  const normalizedRouteSignature = useMemo(
+    () => searchRouteSignature(normalizedRouteState),
+    [normalizedRouteState],
+  );
+  const advancedControlsDirty = useMemo(() => hasNonDefaultAdvancedSearchState({
+    clusterMode,
+    topN,
+    minRelevance,
+    consolidate,
+    consolidateMinOverlap,
+    recencyWeight,
+    tournamentId,
+    seedPlayerIds: selectedTournamentSeedPlayerIds,
+    seedTeamId: selectedTournamentSeedMeta?.teamId ?? null,
+    seedTeamName: selectedTournamentSeedMeta?.teamName ?? '',
+  }), [
+    clusterMode,
+    topN,
+    minRelevance,
+    consolidate,
+    consolidateMinOverlap,
+    recencyWeight,
+    tournamentId,
+    selectedTournamentSeedPlayerIds,
+    selectedTournamentSeedMeta,
+  ]);
 
   const runSearch = useCallback(async (routeState) => {
     setLoading(true);
@@ -418,7 +462,7 @@ export default function TeamSearch({
   }, []);
 
   useEffect(() => {
-    const nextSignature = searchRouteSignature(normalizedRouteState);
+    const nextSignature = normalizedRouteSignature;
     if (nextSignature === hydratedRouteSignatureRef.current) return;
     hydratedRouteSignatureRef.current = nextSignature;
 
@@ -452,7 +496,7 @@ export default function TeamSearch({
       setError('');
       setLoading(false);
     }
-  }, [normalizedRouteState, runSearch]);
+  }, [normalizedRouteSignature, normalizedRouteState, runSearch]);
 
   useEffect(() => {
     setSelectedTournamentSeedMeta(null);
@@ -544,6 +588,29 @@ export default function TeamSearch({
     };
   }, [query]);
 
+  useEffect(() => {
+    if (!showAdvancedControls) return undefined;
+
+    function handlePointerDown(event) {
+      if (!advancedPopoverRef.current?.contains(event.target)) {
+        setShowAdvancedControls(false);
+      }
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') {
+        setShowAdvancedControls(false);
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showAdvancedControls]);
+
   function toggleCardExpansion(teamId) {
     const key = String(teamId);
     setExpandedCards((prev) => {
@@ -607,10 +674,26 @@ export default function TeamSearch({
     setSelectedTournamentSeedPlayerIds([]);
   }
 
+  function resetAdvancedControls() {
+    setClusterMode(DEFAULT_SEARCH_ROUTE_STATE.clusterMode);
+    setTopN(DEFAULT_SEARCH_ROUTE_STATE.topN);
+    setMinRelevance(DEFAULT_SEARCH_ROUTE_STATE.minRelevance);
+    setConsolidate(DEFAULT_SEARCH_ROUTE_STATE.consolidate);
+    setConsolidateMinOverlap(DEFAULT_SEARCH_ROUTE_STATE.consolidateMinOverlap);
+    setRecencyWeight(DEFAULT_SEARCH_ROUTE_STATE.recencyWeight);
+    setTournamentId(DEFAULT_SEARCH_ROUTE_STATE.tournamentId);
+    setTournamentTeamLookup('');
+    clearSeedSelection();
+    setTournamentTeams([]);
+    setTournamentTeamsSource('none');
+    setTournamentTeamsError('');
+    setTournamentTeamsLoading(false);
+  }
+
   async function onSubmit(event) {
     event.preventDefault();
     const nextRouteState = normalizeSearchRouteState({
-      q,
+      q: query,
       clusterMode,
       topN,
       minRelevance,
@@ -625,9 +708,15 @@ export default function TeamSearch({
     if (!nextRouteState.q) return;
     suppressSuggestionsRef.current = true;
     setShowSuggestions(false);
-    hydratedRouteSignatureRef.current = searchRouteSignature(nextRouteState);
     onSearchStateChange(nextRouteState);
-    await runSearch(nextRouteState);
+
+    const nextSignature = searchRouteSignature(nextRouteState);
+    if (nextSignature === normalizedRouteSignature) {
+      hydratedRouteSignatureRef.current = nextSignature;
+      await runSearch(nextRouteState);
+    } else {
+      hydratedRouteSignatureRef.current = '';
+    }
   }
 
   function sameSelection(selectedIds, nextIds) {
@@ -658,289 +747,334 @@ export default function TeamSearch({
       </div>
 
       <form className="form-grid search-form" onSubmit={onSubmit}>
-        <label htmlFor="team-query" className="field-label">Team query</label>
-        <div
-          className="search-input-wrap"
-          onBlur={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget)) {
-              suppressSuggestionsRef.current = false;
-              setTimeout(() => setShowSuggestions(false), 150);
-            }
-          }}
-        >
-          <input
-            id="team-query"
-            ref={queryInputRef}
-            className="input"
-            type="search"
-            placeholder="e.g. FTW, Moonlight, Hypernova"
-            value={query}
-            onChange={(e) => {
-              suppressSuggestionsRef.current = false;
-              setQuery(e.target.value);
-              clearSeedSelection();
-            }}
-            onFocus={() => {
-              if (suggestions.length && !suppressSuggestionsRef.current) setShowSuggestions(true);
-            }}
-            autoComplete="off"
-            role="combobox"
-            aria-expanded={showSuggestions && suggestions.length > 0}
-            aria-controls="team-suggestions"
-            aria-autocomplete="list"
-            required
-          />
-          {showSuggestions && suggestions.length > 0 ? (
-            <ul id="team-suggestions" className="suggestion-dropdown" role="listbox">
-              {suggestions.map((s) => (
-                <li key={s.team_id} role="option" aria-selected={false}>
-                  <button
-                    type="button"
-                    className="suggestion-option"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => {
-                      suppressSuggestionsRef.current = true;
-                      setQuery(s.team_name);
-                      clearSeedSelection();
-                      setShowSuggestions(false);
-                    }}
-                  >
-                    <span className="suggestion-name">{s.team_name}</span>
-                    <span className="suggestion-meta">{s.lineup_count} matches</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
-        {selectedTournamentSeedPlayerIds.length > 0 ? (
-          <div className="seed-affordance" role="status" aria-live="polite">
-            <span className="seed-affordance-label">Embedding seed active</span>
-            <span className="seed-affordance-name">
-              {selectedTournamentSeedMeta?.teamName || 'Tournament team'}
-            </span>
-            <span className="seed-affordance-meta">
-              {selectedTournamentSeedPlayerIds.length} player ID{selectedTournamentSeedPlayerIds.length === 1 ? '' : 's'}
-            </span>
-            <button
-              type="button"
-              className="seed-affordance-clear"
-              onClick={clearSeedSelection}
+        <div className="search-primary-row">
+          <div className="search-primary-field">
+            <label htmlFor="team-query" className="field-label">Team name</label>
+            <div
+              className="search-input-wrap"
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget)) {
+                  suppressSuggestionsRef.current = false;
+                  setTimeout(() => setShowSuggestions(false), 150);
+                }
+              }}
             >
-              Clear seed
-            </button>
-          </div>
-        ) : null}
-
-        <div className="form-row row fields-row tournament-row">
-          <div className="field">
-            <label htmlFor="tournament-id" className="field-label">Tournament ID (optional)</label>
-            <input
-              id="tournament-id"
-              className="input"
-              type="number"
-              min={1}
-              step={1}
-              placeholder="e.g. 3192"
-              value={tournamentId}
-              onChange={(e) => setTournamentId(e.target.value)}
-            />
-            <span className="field-label-subtitle">
-              Scope query rows to this tournament. If missing in snapshot, teams are pulled from sendou.ink.
-            </span>
-          </div>
-          <div className="field tournament-picker-field">
-            <label htmlFor="tournament-team-search" className="field-label">Tournament team pull-down</label>
-            <input
-              id="tournament-team-search"
-              className="input"
-              type="search"
-              placeholder={parsedTournamentId === null ? 'Set tournament ID first' : 'Type team or player name'}
-              value={tournamentTeamLookup}
-              onChange={(event) => setTournamentTeamLookup(event.target.value)}
-              disabled={parsedTournamentId === null}
-            />
-            <span className="field-label-subtitle">
-              Search teams inside the tournament and pick one to fill Team query. Supports unnamed teams via player names.
-            </span>
-            {parsedTournamentId !== null ? (
-              <div className="tournament-team-picker" aria-live="polite">
-                <p className="meta">
-                  {tournamentTeamsLoading
-                    ? 'Loading teams…'
-                    : `${tournamentTeams.length} team${tournamentTeams.length === 1 ? '' : 's'} loaded from ${tournamentTeamsSource}.`}
-                </p>
-                {!tournamentTeamsLoading && tournamentTeams.length ? (
-                  <ul className="tournament-team-dropdown" role="listbox" aria-label="Tournament teams">
-                    {tournamentTeams.slice(0, 80).map((team) => {
-                      const label = tournamentTeamDisplayName(team);
-                      const optionTeamId = safeIntOrNull(team?.team_id);
-                      const isSelectedTeam = selectedTournamentSeedPlayerIds.length > 0
-                        && (
-                          (
-                            Number.isFinite(optionTeamId)
-                            && optionTeamId > 0
-                            && Number.isFinite(selectedTournamentSeedMeta?.teamId)
-                            && Math.trunc(optionTeamId) === Math.trunc(selectedTournamentSeedMeta.teamId)
-                          )
-                          || (
-                            !Number.isFinite(selectedTournamentSeedMeta?.teamId)
-                            && selectedTournamentSeedMeta?.teamName === label
-                          )
-                        );
-                      const baseMeta = tournamentTeamMeta(team);
-                      const meta = isSelectedTeam
-                        ? `${baseMeta ? `${baseMeta} · ` : ''}seeding active`
-                        : baseMeta;
-                      return (
-                        <li
-                          key={tournamentTeamOptionKey(team)}
-                          role="option"
-                          aria-selected={isSelectedTeam}
-                        >
-                          <button
-                            type="button"
-                            className={`tournament-team-option ${isSelectedTeam ? 'is-selected' : ''}`}
-                            onClick={() => onSelectTournamentTeam(team)}
-                            title={meta || label}
-                          >
-                            <span className="tournament-team-option-name">{label}</span>
-                            {meta ? <span className="tournament-team-option-meta">{meta}</span> : null}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                ) : null}
-                {!tournamentTeamsLoading && !tournamentTeams.length && tournamentTeamLookup.trim() ? (
-                  <p className="meta">No teams matched this search.</p>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </div>
-
-        {tournamentTeamsError ? <p className="error">{tournamentTeamsError}</p> : null}
-
-        <div className="form-row row fields-row">
-          <div className="field">
-            <label htmlFor="cluster-mode" className="field-label">Cluster profile</label>
-            <select
-              id="cluster-mode"
-              className="input"
-              value={clusterMode}
-              onChange={(e) => setClusterMode(e.target.value)}
-            >
-              <option value="family">family</option>
-              <option value="strict">strict</option>
-              <option value="explore">explore</option>
-            </select>
-          </div>
-
-          <div className="field">
-            <label className="checkbox-field">
               <input
-                id="consolidate-results"
-                type="checkbox"
-                checked={consolidate}
-                onChange={(e) => setConsolidate(e.target.checked)}
+                id="team-query"
+                ref={queryInputRef}
+                className="input"
+                type="search"
+                placeholder="e.g. FTWin, Moonlight, Healbook"
+                value={query}
+                onChange={(e) => {
+                  suppressSuggestionsRef.current = false;
+                  setQuery(e.target.value);
+                  clearSeedSelection();
+                }}
+                onFocus={() => {
+                  if (suggestions.length && !suppressSuggestionsRef.current) setShowSuggestions(true);
+                }}
+                autoComplete="off"
+                role="combobox"
+                aria-expanded={showSuggestions && suggestions.length > 0}
+                aria-controls="team-suggestions"
+                aria-autocomplete="list"
+                required
               />
-              Consolidate near-duplicate teams
-            </label>
+              {showSuggestions && suggestions.length > 0 ? (
+                <ul id="team-suggestions" className="suggestion-dropdown" role="listbox">
+                  {suggestions.map((s) => (
+                    <li key={s.team_id} role="option" aria-selected={false}>
+                      <button
+                        type="button"
+                        className="suggestion-option"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          suppressSuggestionsRef.current = true;
+                          setQuery(s.team_name);
+                          clearSeedSelection();
+                          setShowSuggestions(false);
+                        }}
+                      >
+                        <span className="suggestion-name">{s.team_name}</span>
+                        <span className="suggestion-meta">{s.lineup_count} matches</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+            <p className="field-hint">Search by team name or numeric team ID. Everything else is optional.</p>
           </div>
 
-          <div className="field">
-            <label htmlFor="top-n" className="field-label">Top N</label>
-            <input
-              id="top-n"
-              className="input"
-              type="number"
-              min={1}
-              max={100}
-              value={topN}
-              onChange={(e) => setTopN(Number(e.target.value) || 20)}
-            />
-          </div>
+          <div className="search-primary-actions">
+            <button className="button btn-pill btn-fuchsia" type="submit" disabled={loading}>
+              {loading ? 'Searching…' : 'Search teams'}
+            </button>
+            <div className="search-advanced-wrap" ref={advancedPopoverRef}>
+              <button
+                type="button"
+                className={`result-select-btn btn-pill btn-fuchsia-outline ${showAdvancedControls || advancedControlsDirty ? 'is-active' : ''}`}
+                onClick={() => setShowAdvancedControls((value) => !value)}
+                aria-expanded={showAdvancedControls}
+                aria-controls="team-search-advanced-controls"
+              >
+                Advanced controls
+                {advancedControlsDirty ? (
+                  <span className="search-advanced-indicator">Modified</span>
+                ) : null}
+              </button>
 
-          <div className="field">
-            <label htmlFor="consolidate-min-overlap" className="field-label slider-label">
-              Consolidation overlap
-            </label>
-            <input
-              id="consolidate-min-overlap"
-              className="input slider-input"
-              type="range"
-              min={0}
-              max={100}
-              step={10}
-              value={Math.round(consolidateMinOverlap * 100)}
-              onChange={(e) => setConsolidateMinOverlap(Number(e.target.value) / 100)}
-              aria-describedby="consolidate-overlap-value"
-              disabled={!consolidate}
-            />
-            <output id="consolidate-overlap-value" className="slider-output">
-              {Math.round(consolidateMinOverlap * 100)}%
-            </output>
-          </div>
+              {showAdvancedControls ? (
+                <div className="search-advanced-popover" id="team-search-advanced-controls">
+                  <div className="search-advanced-header">
+                    <div>
+                      <p className="field-label">Advanced controls</p>
+                      <p className="field-hint">Tune retrieval, consolidation, and tournament scoping.</p>
+                      <p className="search-advanced-defaults">
+                        Defaults: family profile, top 20, minimum relevance 0%, consolidation overlap 80%, recency bias 0%.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="result-select-btn btn-pill"
+                      onClick={resetAdvancedControls}
+                    >
+                      Reset to defaults
+                    </button>
+                  </div>
 
-          <div className="field">
-            <label htmlFor="min-relevance" className="field-label slider-label">
-              Minimum relevance
-            </label>
-            <input
-              id="min-relevance"
-              className="input slider-input"
-              type="range"
-              min={0}
-              max={100}
-              step={10}
-              value={Math.round(minRelevance * 100)}
-              onChange={(e) => setMinRelevance(Number(e.target.value) / 100)}
-              list="relevance-marks"
-              aria-describedby="min-relevance-value"
-            />
-            <output id="min-relevance-value" className="slider-output">
-              {Math.round(minRelevance * 100)}%
-            </output>
-            <datalist id="relevance-marks">
-              <option value="0" label="0%" />
-              <option value="10" label="10%" />
-              <option value="20" label="20%" />
-              <option value="30" label="30%" />
-              <option value="40" label="40%" />
-              <option value="50" label="50%" />
-              <option value="60" label="60%" />
-              <option value="70" label="70%" />
-              <option value="80" label="80%" />
-              <option value="90" label="90%" />
-              <option value="100" label="100%" />
-            </datalist>
-          </div>
+                  <div className="search-advanced-panel">
+                    {selectedTournamentSeedPlayerIds.length > 0 ? (
+                      <div className="seed-affordance" role="status" aria-live="polite">
+                        <span className="seed-affordance-label">Embedding seed active</span>
+                        <span className="seed-affordance-name">
+                          {selectedTournamentSeedMeta?.teamName || 'Tournament team'}
+                        </span>
+                        <span className="seed-affordance-meta">
+                          {selectedTournamentSeedPlayerIds.length} player ID{selectedTournamentSeedPlayerIds.length === 1 ? '' : 's'}
+                        </span>
+                        <button
+                          type="button"
+                          className="seed-affordance-clear"
+                          onClick={clearSeedSelection}
+                        >
+                          Clear seed
+                        </button>
+                      </div>
+                    ) : null}
 
-          <div className="field">
-            <label htmlFor="recency-weight" className="field-label slider-label">
-              Recency bias
-            </label>
-            <input
-              id="recency-weight"
-              className="input slider-input"
-              type="range"
-              min={0}
-              max={100}
-              step={10}
-              value={Math.round(recencyWeight * 100)}
-              onChange={(e) => setRecencyWeight(Number(e.target.value) / 100)}
-              aria-describedby="recency-weight-value"
-            />
-            <output id="recency-weight-value" className="slider-output">
-              {Math.round(recencyWeight * 100)}%
-            </output>
+                    <div className="form-row row fields-row tournament-row">
+                      <div className="field">
+                        <label htmlFor="tournament-id" className="field-label">Tournament ID (optional)</label>
+                        <input
+                          id="tournament-id"
+                          className="input"
+                          type="number"
+                          min={1}
+                          step={1}
+                          placeholder="e.g. 3192"
+                          value={tournamentId}
+                          onChange={(e) => setTournamentId(e.target.value)}
+                        />
+                        <span className="field-label-subtitle">
+                          Scope query rows to this tournament. If missing in snapshot, teams are pulled from sendou.ink.
+                        </span>
+                      </div>
+                      <div className="field tournament-picker-field">
+                        <label htmlFor="tournament-team-search" className="field-label">Tournament team pull-down</label>
+                        <input
+                          id="tournament-team-search"
+                          className="input"
+                          type="search"
+                          placeholder={parsedTournamentId === null ? 'Set tournament ID first' : 'Type team or player name'}
+                          value={tournamentTeamLookup}
+                          onChange={(event) => setTournamentTeamLookup(event.target.value)}
+                          disabled={parsedTournamentId === null}
+                        />
+                        <span className="field-label-subtitle">
+                          Search teams inside the tournament and pick one to fill Team query. Supports unnamed teams via player names.
+                        </span>
+                        {parsedTournamentId !== null ? (
+                          <div className="tournament-team-picker" aria-live="polite">
+                            <p className="meta">
+                              {tournamentTeamsLoading
+                                ? 'Loading teams…'
+                                : `${tournamentTeams.length} team${tournamentTeams.length === 1 ? '' : 's'} loaded from ${tournamentTeamsSource}.`}
+                            </p>
+                            {!tournamentTeamsLoading && tournamentTeams.length ? (
+                              <ul className="tournament-team-dropdown" role="listbox" aria-label="Tournament teams">
+                                {tournamentTeams.slice(0, 80).map((team) => {
+                                  const label = tournamentTeamDisplayName(team);
+                                  const optionTeamId = safeIntOrNull(team?.team_id);
+                                  const isSelectedTeam = selectedTournamentSeedPlayerIds.length > 0
+                                    && (
+                                      (
+                                        Number.isFinite(optionTeamId)
+                                        && optionTeamId > 0
+                                        && Number.isFinite(selectedTournamentSeedMeta?.teamId)
+                                        && Math.trunc(optionTeamId) === Math.trunc(selectedTournamentSeedMeta.teamId)
+                                      )
+                                      || (
+                                        !Number.isFinite(selectedTournamentSeedMeta?.teamId)
+                                        && selectedTournamentSeedMeta?.teamName === label
+                                      )
+                                    );
+                                  const baseMeta = tournamentTeamMeta(team);
+                                  const meta = isSelectedTeam
+                                    ? `${baseMeta ? `${baseMeta} · ` : ''}seeding active`
+                                    : baseMeta;
+                                  return (
+                                    <li
+                                      key={tournamentTeamOptionKey(team)}
+                                      role="option"
+                                      aria-selected={isSelectedTeam}
+                                    >
+                                      <button
+                                        type="button"
+                                        className={`tournament-team-option ${isSelectedTeam ? 'is-selected' : ''}`}
+                                        onClick={() => onSelectTournamentTeam(team)}
+                                        title={meta || label}
+                                      >
+                                        <span className="tournament-team-option-name">{label}</span>
+                                        {meta ? <span className="tournament-team-option-meta">{meta}</span> : null}
+                                      </button>
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            ) : null}
+                            {!tournamentTeamsLoading && !tournamentTeams.length && tournamentTeamLookup.trim() ? (
+                              <p className="meta">No teams matched this search.</p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    {tournamentTeamsError ? <p className="error">{tournamentTeamsError}</p> : null}
+
+                    <div className="form-row row fields-row">
+                      <div className="field">
+                        <label htmlFor="cluster-mode" className="field-label">Cluster profile</label>
+                        <select
+                          id="cluster-mode"
+                          className="input"
+                          value={clusterMode}
+                          onChange={(e) => setClusterMode(e.target.value)}
+                        >
+                          <option value="family">family</option>
+                          <option value="strict">strict</option>
+                          <option value="explore">explore</option>
+                        </select>
+                      </div>
+
+                      <div className="field">
+                        <label className="checkbox-field">
+                          <input
+                            id="consolidate-results"
+                            type="checkbox"
+                            checked={consolidate}
+                            onChange={(e) => setConsolidate(e.target.checked)}
+                          />
+                          Consolidate near-duplicate teams
+                        </label>
+                      </div>
+
+                      <div className="field">
+                        <label htmlFor="top-n" className="field-label">Top N</label>
+                        <input
+                          id="top-n"
+                          className="input"
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={topN}
+                          onChange={(e) => setTopN(Number(e.target.value) || DEFAULT_SEARCH_ROUTE_STATE.topN)}
+                        />
+                      </div>
+
+                      <div className="field">
+                        <label htmlFor="consolidate-min-overlap" className="field-label slider-label">
+                          Consolidation overlap
+                        </label>
+                        <input
+                          id="consolidate-min-overlap"
+                          className="input slider-input"
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={10}
+                          value={Math.round(consolidateMinOverlap * 100)}
+                          onChange={(e) => setConsolidateMinOverlap(Number(e.target.value) / 100)}
+                          aria-describedby="consolidate-overlap-value"
+                          disabled={!consolidate}
+                        />
+                        <output id="consolidate-overlap-value" className="slider-output">
+                          {Math.round(consolidateMinOverlap * 100)}%
+                        </output>
+                      </div>
+
+                      <div className="field">
+                        <label htmlFor="min-relevance" className="field-label slider-label">
+                          Minimum relevance
+                        </label>
+                        <input
+                          id="min-relevance"
+                          className="input slider-input"
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={10}
+                          value={Math.round(minRelevance * 100)}
+                          onChange={(e) => setMinRelevance(Number(e.target.value) / 100)}
+                          list="relevance-marks"
+                          aria-describedby="min-relevance-value"
+                        />
+                        <output id="min-relevance-value" className="slider-output">
+                          {Math.round(minRelevance * 100)}%
+                        </output>
+                        <datalist id="relevance-marks">
+                          <option value="0" label="0%" />
+                          <option value="10" label="10%" />
+                          <option value="20" label="20%" />
+                          <option value="30" label="30%" />
+                          <option value="40" label="40%" />
+                          <option value="50" label="50%" />
+                          <option value="60" label="60%" />
+                          <option value="70" label="70%" />
+                          <option value="80" label="80%" />
+                          <option value="90" label="90%" />
+                          <option value="100" label="100%" />
+                        </datalist>
+                      </div>
+
+                      <div className="field">
+                        <label htmlFor="recency-weight" className="field-label slider-label">
+                          Recency bias
+                        </label>
+                        <input
+                          id="recency-weight"
+                          className="input slider-input"
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={10}
+                          value={Math.round(recencyWeight * 100)}
+                          onChange={(e) => setRecencyWeight(Number(e.target.value) / 100)}
+                          aria-describedby="recency-weight-value"
+                        />
+                        <output id="recency-weight-value" className="slider-output">
+                          {Math.round(recencyWeight * 100)}%
+                        </output>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
-
-        <button className="button btn-pill btn-fuchsia" type="submit" disabled={loading}>
-          {loading ? 'Searching…' : 'Search teams'}
-        </button>
       </form>
 
       <p className="status" role="status" aria-live="polite">{resultLabel}</p>

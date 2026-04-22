@@ -5,7 +5,7 @@ export const DEFAULT_SEARCH_ROUTE_STATE = {
   q: '',
   clusterMode: 'family',
   topN: 20,
-  minRelevance: 0.8,
+  minRelevance: 0,
   consolidate: true,
   consolidateMinOverlap: 0.8,
   recencyWeight: 0,
