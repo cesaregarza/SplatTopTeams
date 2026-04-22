@@ -3,8 +3,9 @@ import { fetchAnalyticsTeam, fetchAnalyticsTeamMatches, fetchTeamSearch } from '
 
 const DEFAULT_CLUSTER_MODE = 'family';
 const DEFAULT_NEIGHBORS = 12;
-const DEFAULT_MATCH_LIMIT = 25;
+const DEFAULT_MATCH_LIMIT = 100;
 const DEFAULT_TEAM_SCOPE = 'family';
+const HISTORY_EVENTS_PER_PAGE = 5;
 
 function parseTeamIdList(value) {
   if (Array.isArray(value)) {
@@ -36,15 +37,24 @@ function uniqueTeamIds(values) {
   return out;
 }
 
-function sameTeamIds(left, right) {
-  const normalizedLeft = uniqueTeamIds(parseTeamIdList(left));
-  const normalizedRight = uniqueTeamIds(parseTeamIdList(right));
-  if (normalizedLeft.length !== normalizedRight.length) return false;
-  const rightSet = new Set(normalizedRight);
-  return normalizedLeft.every((value) => rightSet.has(value));
+function pluralize(value, singular, plural) {
+  const numeric = Number(value);
+  const count = Number.isFinite(numeric) ? Math.trunc(numeric) : 0;
+  let pluralForm = plural;
+  if (!pluralForm) {
+    if (/(s|x|z|ch|sh)$/i.test(singular)) {
+      pluralForm = `${singular}es`;
+    } else if (/[^aeiou]y$/i.test(singular)) {
+      pluralForm = `${singular.slice(0, -1)}ies`;
+    } else {
+      pluralForm = `${singular}s`;
+    }
+  }
+  return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
 function pct(value) {
+  if (value === null || value === undefined || value === '') return 'n/a';
   const numeric = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(numeric)) return 'n/a';
   return `${(numeric * 100).toFixed(1)}%`;
@@ -103,7 +113,11 @@ function relativeDate(ms) {
 function rosterPreview(players, limit = 4) {
   if (!Array.isArray(players) || players.length === 0) return 'n/a';
   const names = players
-    .map((player) => String(player?.player_name || '').trim())
+    .map((player) => (
+      typeof player === 'string'
+        ? player.trim()
+        : String(player?.player_name || player?.name || '').trim()
+    ))
     .filter(Boolean);
   if (!names.length) return 'n/a';
   const preview = names.slice(0, limit).join(', ');
@@ -136,6 +150,32 @@ function normalizePlayerRows(values) {
   return out;
 }
 
+function playerRowKey(player) {
+  if (player?.id !== null && player?.id !== undefined && Number.isFinite(Number(player.id))) {
+    return `id:${Math.trunc(Number(player.id))}`;
+  }
+  return `name:${normalizeTimelineName(player?.name)}`;
+}
+
+function normalizeRosterPlayers(values) {
+  if (!Array.isArray(values) || !values.length) return [];
+  const seen = new Set();
+  const out = [];
+
+  for (const value of values) {
+    const name = typeof value === 'string'
+      ? value.trim()
+      : String(value?.player_name || value?.name || '').trim();
+    if (!name) continue;
+    const key = normalizeTimelineName(name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(name);
+  }
+
+  return out;
+}
+
 function rowMatchesSelectedTeam(row, teamIds) {
   const rowIds = uniqueTeamIds([
     Number(row?.team_id),
@@ -144,13 +184,14 @@ function rowMatchesSelectedTeam(row, teamIds) {
   return rowIds.some((teamId) => teamIds.includes(teamId));
 }
 
-function playerRole(player, baselineMatches, index) {
-  if (player.matchesPlayed <= 0) return 'Top lineup';
-  if (baselineMatches <= 0) return index < 4 ? 'Core' : 'Rotation';
+function playerUsageDescriptor(player, baselineMatches, index) {
+  if (player.matchesPlayed <= 0) return 'top-lineup reference';
+  if (baselineMatches <= 0) return index < 4 ? 'core' : 'sub';
   const share = player.matchesPlayed / baselineMatches;
-  if (share >= 0.75) return 'Core';
-  if (share >= 0.4) return 'Regular';
-  return 'Rotation';
+  if (share >= 0.75) return 'core';
+  if (share >= 0.4) return 'regular';
+  if (player.matchesPlayed <= 1) return 'one-off';
+  return 'sub';
 }
 
 function continuityLabel(topShare, distinctLineups) {
@@ -162,7 +203,10 @@ function continuityLabel(topShare, distinctLineups) {
 
 function buildRecentForm(matches, limit = 5) {
   if (!Array.isArray(matches) || !matches.length) return [];
-  return matches.slice(0, limit).map((row) => ({
+  return [...matches]
+    .sort((left, right) => Number(right?.event_time_ms || 0) - Number(left?.event_time_ms || 0))
+    .slice(0, limit)
+    .map((row) => ({
     key: row?.match_id ?? `${row?.event_time_ms ?? 'na'}-${row?.opponent_team_id ?? 'na'}`,
     label: row?.team_is_winner ? 'W' : row?.opponent_is_winner ? 'L' : '—',
     tone: row?.team_is_winner ? 'is-win' : row?.opponent_is_winner ? 'is-loss' : 'is-pending',
@@ -231,19 +275,67 @@ function buildMatchEvents(matches) {
       scoreLabel: matchScoreLabel(row),
       teamRosterLabel: rosterPreview(row?.team_roster),
       opponentRosterLabel: rosterPreview(row?.opponent_roster),
+      teamRosterPlayers: normalizeRosterPlayers(row?.team_roster),
+      opponentRosterPlayers: normalizeRosterPlayers(row?.opponent_roster),
     });
   }
 
   return Array.from(groups.values())
-    .map((group) => ({
-      ...group,
-      whenLabel: group.latestEventTimeMs ? relativeDate(group.latestEventTimeMs) : 'n/a',
-      rows: group.rows.sort((left, right) => {
+    .map((group) => {
+      const rowsByNewest = [...group.rows].sort((left, right) => {
         const leftScore = Number(left.eventTimeMs || 0);
         const rightScore = Number(right.eventTimeMs || 0);
         return rightScore - leftScore;
-      }),
-    }))
+      });
+      const rowsByOldest = [...rowsByNewest].reverse();
+      const opponentCounts = new Map();
+      const teamRosterCounts = new Map();
+      for (const row of rowsByNewest) {
+        const opponentKey = row.opponentTeamId
+          ? `id:${row.opponentTeamId}`
+          : `name:${String(row.opponentTeamName || '').toLowerCase()}`;
+        const existing = opponentCounts.get(opponentKey);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          opponentCounts.set(opponentKey, { name: row.opponentTeamName, count: 1 });
+        }
+        const teamRosterKey = String(row.teamRosterLabel || '').toLowerCase();
+        if (teamRosterKey) {
+          teamRosterCounts.set(teamRosterKey, {
+            label: row.teamRosterLabel,
+            count: (teamRosterCounts.get(teamRosterKey)?.count || 0) + 1,
+          });
+        }
+      }
+      const opponentSummaryItems = Array.from(opponentCounts.values())
+        .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name));
+      const opponentSummary = opponentSummaryItems
+        .slice(0, 3)
+        .map((item) => (item.count > 1 ? `${item.name} (${item.count})` : item.name))
+        .join(', ');
+      const remainingOpponents = opponentSummaryItems.length - 3;
+      const defaultTeamRoster = Array.from(teamRosterCounts.values())
+        .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))[0];
+
+      return {
+        ...group,
+        whenLabel: group.latestEventTimeMs ? relativeDate(group.latestEventTimeMs) : 'n/a',
+        opponentSummary: remainingOpponents > 0 ? `${opponentSummary} +${remainingOpponents} more` : opponentSummary,
+        defaultTeamRosterLabel: defaultTeamRoster?.label || '',
+        rows: rowsByOldest.map((row) => {
+          const opponentKey = row.opponentTeamId
+            ? `id:${row.opponentTeamId}`
+            : `name:${String(row.opponentTeamName || '').toLowerCase()}`;
+          return {
+            ...row,
+            opponentEventCount: opponentCounts.get(opponentKey)?.count || 1,
+            usesDefaultTeamRoster: defaultTeamRoster?.label ? defaultTeamRoster.label === row.teamRosterLabel : false,
+          };
+        }),
+        ribbonRows: rowsByOldest,
+      };
+    })
     .sort((left, right) => right.latestEventTimeMs - left.latestEventTimeMs);
 }
 
@@ -328,11 +420,14 @@ export default function TeamExplorer({
   const [teamScope, setTeamScope] = useState(DEFAULT_TEAM_SCOPE);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [warning, setWarning] = useState('');
   const [teamLab, setTeamLab] = useState(null);
   const [teamProfile, setTeamProfile] = useState(null);
   const [matchHistory, setMatchHistory] = useState(null);
   const [matchHistoryError, setMatchHistoryError] = useState('');
   const [resolvedTeamIds, setResolvedTeamIds] = useState([]);
+  const [expandedEventKeys, setExpandedEventKeys] = useState([]);
+  const [historyPage, setHistoryPage] = useState(1);
   const previousScopeRef = useRef(DEFAULT_TEAM_SCOPE);
 
   const selectedIds = useMemo(
@@ -349,6 +444,7 @@ export default function TeamExplorer({
     const requestedIds = uniqueTeamIds(parseTeamIdList(nextTeamIds));
     if (!requestedIds.length) {
       setError('Enter at least one valid team ID.');
+      setWarning('');
       setTeamLab(null);
       setTeamProfile(null);
       setMatchHistory(null);
@@ -360,7 +456,10 @@ export default function TeamExplorer({
 
     setLoading(true);
     setError('');
+    setWarning('');
     setMatchHistoryError('');
+    setHistoryPage(1);
+    setExpandedEventKeys([]);
     setResolvedTeamIds(requestedIds);
     try {
       const [teamPayload, searchPayload] = await Promise.allSettled([
@@ -379,19 +478,23 @@ export default function TeamExplorer({
           consolidateMinOverlap: 0.8,
         }),
       ]);
-      if (teamPayload.status !== 'fulfilled') {
-        throw teamPayload.reason;
-      }
-
-      setTeamLab(teamPayload.value);
-
       let matchedRow = null;
+      const teamLabValue = teamPayload.status === 'fulfilled' ? teamPayload.value : null;
+      setTeamLab(teamLabValue);
       if (searchPayload.status === 'fulfilled') {
         const searchRows = searchPayload.value?.results || [];
         matchedRow = resolveTeamProfileRow(searchRows, requestedIds);
         setTeamProfile(matchedRow || searchRows[0] || null);
       } else {
         setTeamProfile(null);
+      }
+
+      let partialWarning = '';
+      if (!teamLabValue && searchPayload.status === 'fulfilled') {
+        partialWarning = 'Team analytics are temporarily unavailable. Showing the search snapshot and any match data that loads.';
+      }
+      if (!teamLabValue && searchPayload.status !== 'fulfilled') {
+        throw teamPayload.reason || searchPayload.reason || new Error('Failed to load team detail');
       }
 
       const effectiveIds = resolveScopedTeamIds(requestedIds, matchedRow, teamScope);
@@ -409,8 +512,10 @@ export default function TeamExplorer({
         setMatchHistory(null);
         setMatchHistoryError('Recent matches are unavailable right now.');
       }
+      setWarning(partialWarning);
 
     } catch (err) {
+      setWarning('');
       setTeamLab(null);
       setTeamProfile(null);
       setMatchHistory(null);
@@ -440,37 +545,64 @@ export default function TeamExplorer({
 
   const summary = matchHistory?.summary || null;
   const team = teamLab?.team || null;
-  const enteredIds = useMemo(
-    () => uniqueTeamIds(parseTeamIdList(teamIdsInput)),
-    [teamIdsInput],
-  );
   const teamProfilePlayers = useMemo(
     () => normalizePlayerRows(teamProfile?.core_lineup_players || teamProfile?.top_lineup_players || []),
     [teamProfile],
   );
-  const topLineupPlayers = useMemo(
-    () => normalizePlayerRows(teamProfile?.top_lineup_players || []),
-    [teamProfile],
-  );
+  const rosterOrderByPlayer = useMemo(() => {
+    const map = new Map();
+    teamProfilePlayers.forEach((player, index) => {
+      map.set(playerRowKey(player), index);
+    });
+    return map;
+  }, [teamProfilePlayers]);
+  const rosterPresenceByPlayer = useMemo(() => {
+    const map = new Map();
+    teamProfilePlayers.forEach((player) => {
+      map.set(playerRowKey(player), player.matchesPlayed);
+    });
+    return map;
+  }, [teamProfilePlayers]);
+  const topLineupPlayers = useMemo(() => {
+    const players = normalizePlayerRows(teamProfile?.top_lineup_players || []);
+    return players
+      .map((player) => ({
+        ...player,
+        rosterMatchesPlayed: rosterPresenceByPlayer.get(playerRowKey(player)) ?? null,
+      }))
+      .sort((left, right) => {
+        const leftOrder = rosterOrderByPlayer.get(playerRowKey(left));
+        const rightOrder = rosterOrderByPlayer.get(playerRowKey(right));
+        if (leftOrder !== undefined || rightOrder !== undefined) {
+          return (leftOrder ?? Number.MAX_SAFE_INTEGER) - (rightOrder ?? Number.MAX_SAFE_INTEGER);
+        }
+        return left.name.localeCompare(right.name);
+      });
+  }, [rosterOrderByPlayer, rosterPresenceByPlayer, teamProfile]);
   const neighborsRows = teamLab?.neighbors || [];
   const matches = matchHistory?.matches || [];
   const fallbackSummary = useMemo(() => {
-    if (!teamLab?.team) return null;
-    const familyIds = resolvedTeamIds.length ? resolvedTeamIds : selectedIds.length ? selectedIds : [teamLab.team.team_id];
+    const primaryTeamId = Number(teamProfile?.team_id ?? teamLab?.team?.team_id);
+    const primaryTeamName = String(teamProfile?.team_name || teamLab?.team?.team_name || '').trim();
+    if (!Number.isFinite(primaryTeamId) || primaryTeamId <= 0 || !primaryTeamName) return null;
+
+    const familyIds = resolvedTeamIds.length ? resolvedTeamIds : selectedIds.length ? selectedIds : [Math.trunc(primaryTeamId)];
     const familyNames = familyIds.map((teamId) => {
-      if (teamId === teamLab.team.team_id) return teamLab.team.team_name;
+      if (teamId === Math.trunc(primaryTeamId)) return primaryTeamName;
       return `Team ${teamId}`;
     });
     const fallbackMatchSummary = teamLab?.match_summary || {};
     const wins = Number(fallbackMatchSummary.wins);
-    const totalMatches = Number(fallbackMatchSummary.matches);
+    const totalMatches = Number.isFinite(Number(fallbackMatchSummary.matches))
+      ? Number(fallbackMatchSummary.matches)
+      : Number(teamProfile?.match_count);
     const losses = Number.isFinite(totalMatches) && Number.isFinite(wins)
       ? Math.max(0, totalMatches - wins)
       : 0;
 
     return {
       primary_team_id: familyIds[0],
-      primary_team_name: teamLab.team.team_name,
+      primary_team_name: primaryTeamName,
       team_ids: familyIds,
       team_names: familyNames,
       selected_team_count: familyIds.length,
@@ -479,12 +611,12 @@ export default function TeamExplorer({
       losses,
       unresolved_matches: 0,
       decided_matches: Number.isFinite(totalMatches) ? totalMatches : 0,
-      win_rate: Number(fallbackMatchSummary.win_rate) || 0,
-      tournaments: 0,
+      win_rate: fallbackMatchSummary.win_rate,
+      tournaments: Number(teamProfile?.tournament_count) || 0,
       tournament_tier_distribution: null,
       tournament_tier_match_distribution: null,
     };
-  }, [resolvedTeamIds, selectedIds, teamLab]);
+  }, [resolvedTeamIds, selectedIds, teamLab, teamProfile]);
   const effectiveSummary = summary || fallbackSummary;
   const pageTitle = effectiveSummary?.primary_team_name
     || team?.team_name
@@ -499,12 +631,12 @@ export default function TeamExplorer({
   const playerBaselineMatches = Number(teamProfile?.match_count ?? effectiveSummary?.total_matches ?? teamLab?.match_summary?.matches ?? 0);
   const primaryMatchCount = Number(teamProfile?.match_count ?? effectiveSummary?.total_matches ?? teamLab?.match_summary?.matches ?? 0);
   const tournamentCount = Number(teamProfile?.tournament_count ?? effectiveSummary?.tournaments ?? 0);
-  const uniquePlayerCount = Number(teamProfile?.unique_player_count ?? teamProfilePlayers.length ?? 0);
+  const trackedPlayerCount = teamProfilePlayers.length || Number(teamProfile?.unique_player_count) || 0;
   const distinctLineupCount = Number(teamProfile?.distinct_lineup_count ?? team?.distinct_lineup_count ?? 0);
   const topLineupShare = Number(teamProfile?.top_lineup_match_share ?? teamProfile?.top_lineup_share);
+  const topLineupMatchCount = Number(teamProfile?.top_lineup_match_count ?? 0);
   const rotationPlayers = teamProfilePlayers.slice(4);
   const continuityHint = continuityLabel(topLineupShare, distinctLineupCount);
-  const lastActiveLabel = teamProfile?.event_time_ms ? relativeDate(teamProfile.event_time_ms) : 'n/a';
   const actionSnapshotId = matchHistory?.snapshot_id || normalizedSelectedSnapshotId || null;
   const registrationRows = useMemo(() => {
     const primary = teamProfile
@@ -524,47 +656,102 @@ export default function TeamExplorer({
   }, [teamProfile]);
   const nameTimelineRows = useMemo(() => buildNameTimeline(registrationRows), [registrationRows]);
   const comparableRows = neighborsRows.slice(0, 8);
+  const comparableNameCounts = useMemo(() => {
+    const counts = new Map();
+    for (const row of comparableRows) {
+      const key = normalizeTimelineName(row?.team_name);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return counts;
+  }, [comparableRows]);
   const matchEvents = useMemo(() => buildMatchEvents(matches), [matches]);
-  const teamSummaryLine = useMemo(() => {
-    if (!pageTitle) return '';
-    const bits = [
-      primaryMatchCount > 0 ? `${pageTitle} has ${primaryMatchCount} recorded matches` : null,
-      tournamentCount > 0 ? `across ${tournamentCount} event${tournamentCount === 1 ? '' : 's'}` : null,
-      uniquePlayerCount > 0 ? `with ${uniquePlayerCount} player${uniquePlayerCount === 1 ? '' : 's'} used` : null,
-    ].filter(Boolean);
-    if (!bits.length && uniquePlayerCount > 0) {
-      bits.push(`${pageTitle} has ${uniquePlayerCount} player${uniquePlayerCount === 1 ? '' : 's'} in the current roster profile`);
+  const historyPageCount = useMemo(
+    () => Math.max(1, Math.ceil(matchEvents.length / HISTORY_EVENTS_PER_PAGE)),
+    [matchEvents.length],
+  );
+  const visibleMatchEvents = useMemo(() => {
+    const start = (historyPage - 1) * HISTORY_EVENTS_PER_PAGE;
+    return matchEvents.slice(start, start + HISTORY_EVENTS_PER_PAGE);
+  }, [historyPage, matchEvents]);
+  const latestMatchEventMs = useMemo(
+    () => matches.reduce((latest, row) => Math.max(latest, Number(row?.event_time_ms || 0)), 0),
+    [matches],
+  );
+  const latestRegistrationMs = registrationRows.length ? Number(registrationRows[0]?.event_time_ms || 0) : 0;
+  const lastSeenMs = latestMatchEventMs || latestRegistrationMs || Number(teamProfile?.event_time_ms || 0);
+  const lastSeenLabel = lastSeenMs ? relativeDate(lastSeenMs) : 'n/a';
+  const lineupSupportMismatch = useMemo(() => {
+    if (!(topLineupMatchCount > 0)) return false;
+    return topLineupPlayers.some((player) => (
+      Number.isFinite(player.rosterMatchesPlayed)
+      && player.rosterMatchesPlayed > 0
+      && player.rosterMatchesPlayed < topLineupMatchCount
+    ));
+  }, [topLineupMatchCount, topLineupPlayers]);
+  const topLineupMeta = useMemo(() => {
+    if (lineupSupportMismatch) {
+      return 'Lineup composition is available, but its appearance count does not line up with roster presence in this snapshot.';
     }
-    if (!bits.length && tournamentCount > 0) {
-      bits.push(`${pageTitle} appears in ${tournamentCount} tracked event${tournamentCount === 1 ? '' : 's'}`);
-    }
-    if (!bits.length) return '';
-    const continuity = Number.isFinite(topLineupShare)
-      ? `Top lineup share is ${pct(topLineupShare)}, which points to ${continuityHint.toLowerCase()}.`
-      : '';
-    return `${bits.join(' ')}. ${continuity}`.trim();
-  }, [continuityHint, pageTitle, primaryMatchCount, topLineupShare, tournamentCount, uniquePlayerCount]);
+    return [
+      topLineupMatchCount > 0 ? pluralize(topLineupMatchCount, 'lineup appearance') : null,
+      Number.isFinite(topLineupShare) ? `${pct(topLineupShare)} of tracked matches` : null,
+    ].filter(Boolean).join(' · ') || 'Current lineup summary unavailable.';
+  }, [lineupSupportMismatch, topLineupMatchCount, topLineupShare]);
+  useEffect(() => {
+    setHistoryPage((previousPage) => {
+      if (previousPage < 1) return 1;
+      if (previousPage > historyPageCount) return historyPageCount;
+      return previousPage;
+    });
+  }, [historyPageCount]);
+  useEffect(() => {
+    setExpandedEventKeys((previousKeys) => {
+      const availableKeys = new Set(visibleMatchEvents.map((event) => event.key));
+      const retainedKeys = previousKeys.filter((key) => availableKeys.has(key));
+      if (retainedKeys.length) return retainedKeys;
+      return visibleMatchEvents.length ? [visibleMatchEvents[0].key] : [];
+    });
+  }, [visibleMatchEvents]);
   const recentForm = useMemo(() => buildRecentForm(matches), [matches]);
-  const scopeSummary = useMemo(() => {
-    if (!selectedFamilyIds.length) return '';
-
+  const knownNameCount = nameTimelineRows.length;
+  const canonicalName = String(pageTitle || '').trim();
+  const heroAliases = nameTimelineRows.slice(0, 5);
+  const heroKicker = useMemo(() => {
     if (teamScope === 'family') {
-      if (enteredIds.length && !sameTeamIds(enteredIds, selectedFamilyIds)) {
-        return `Family mode expanded ${enteredIds[0]} into ${selectedFamilyIds.length} related registrations.`;
-      }
-      return `Family mode is using ${selectedFamilyIds.length} registration${selectedFamilyIds.length === 1 ? '' : 's'} together.`;
+      const parts = ['Canonical team family'];
+      if (selectedFamilyIds.length) parts.push(pluralize(selectedFamilyIds.length, 'registration'));
+      if (knownNameCount > 0) parts.push(pluralize(knownNameCount, 'name'));
+      return parts.join(' · ');
     }
-
-    return `Individual mode is using exactly ${selectedFamilyIds.length} ID${selectedFamilyIds.length === 1 ? '' : 's'}.`;
-  }, [enteredIds, selectedFamilyIds, teamScope]);
-  const scopeExpanded = teamScope === 'family'
-    && enteredIds.length
-    && selectedFamilyIds.length
-    && !sameTeamIds(enteredIds, selectedFamilyIds);
-
+    return `Loaded team registration · ${pluralize(selectedFamilyIds.length || 1, 'registration')}`;
+  }, [knownNameCount, selectedFamilyIds.length, teamScope]);
+  const performanceStats = useMemo(() => ([
+    { label: 'Win Rate', value: pct(effectiveSummary?.win_rate ?? teamLab?.match_summary?.win_rate) },
+    { label: 'Recorded Matches', value: primaryMatchCount || 'n/a' },
+    { label: 'Events', value: tournamentCount || 'n/a' },
+    { label: 'Last Seen', value: lastSeenLabel },
+  ]), [effectiveSummary?.win_rate, lastSeenLabel, primaryMatchCount, teamLab?.match_summary?.win_rate, tournamentCount]);
+  const rosterStats = useMemo(() => ([
+    { label: 'Tracked Players', value: trackedPlayerCount || 'n/a' },
+    { label: 'Distinct Lineups', value: distinctLineupCount || 'n/a' },
+    { label: 'Most Common Lineup Share', value: Number.isFinite(topLineupShare) ? pct(topLineupShare) : 'n/a' },
+    { label: 'Rotation Pattern', value: continuityHint },
+  ]), [continuityHint, distinctLineupCount, topLineupShare, trackedPlayerCount]);
   async function onSubmit(event) {
     event.preventDefault();
     await loadTeam(teamIdsInput, normalizedSelectedSnapshotId);
+  }
+
+  function toggleEventKey(eventKey) {
+    setExpandedEventKeys((previousKeys) => (
+      previousKeys.includes(eventKey)
+        ? previousKeys.filter((key) => key !== eventKey)
+        : [...previousKeys, eventKey]
+    ));
+  }
+
+  function changeHistoryPage(nextPage) {
+    setHistoryPage(Math.max(1, Math.min(historyPageCount, nextPage)));
   }
 
   return (
@@ -639,83 +826,53 @@ export default function TeamExplorer({
 
       {team || effectiveSummary ? (
         <>
-          {scopeSummary ? (
-            <div className="team-scope-banner" role="status">
-              <span className="team-scope-icon">{teamScope === 'family' ? 'F' : '1'}</span>
-              <span>
-                {scopeExpanded
-                  ? `Family mode expanded ${enteredIds[0]} into ${selectedFamilyIds.length} related registrations.`
-                  : scopeSummary}
-              </span>
-            </div>
-          ) : null}
-          {teamSummaryLine ? (
-            <p className="team-analyst-summary">{teamSummaryLine}</p>
-          ) : null}
-          {nameTimelineRows.length ? (
-            <div className="team-alias-strip">
-              <div className="team-alias-head">
-                <p className="team-alias-kicker">
-                  Name history{teamScope === 'family' ? ` · family of ${selectedFamilyIds.length}` : ''}
-                </p>
-                <span className="team-alias-meta">newest unique names → oldest</span>
-              </div>
-              <div className="team-alias-rail">
-                {nameTimelineRows.map((row, index) => {
-                  const isCurrent = index === 0;
-                  return (
-                    <div
-                      key={`team-alias-${row.key}`}
-                      className={`team-alias-item ${isCurrent ? 'is-current' : ''}`}
-                      title={`${row.name} · ${row.registrationCount} registration${row.registrationCount === 1 ? '' : 's'} · ${row.totalMatches} matches`}
-                    >
-                      <div className="team-alias-name">{row.name}</div>
-                      <div className="team-alias-date">
-                        {row.latestEventTimeMs ? relativeDate(row.latestEventTimeMs) : 'n/a'}
-                      </div>
-                      <div className="team-alias-matches">
-                        {row.registrationCount} registration{row.registrationCount === 1 ? '' : 's'} · {row.totalMatches} matches
-                      </div>
-                    </div>
-                  );
-                })}
+          <div className="team-identity-hero">
+            <div className="team-identity-head">
+              <div>
+                <p className="team-identity-kicker">{heroKicker}</p>
+                <h3 className="team-identity-name">{canonicalName || 'Team'}</h3>
               </div>
             </div>
+            {heroAliases.length ? (
+              <div className="team-identity-aliases" aria-label="Known family names">
+                {heroAliases.map((row, index) => (
+                  <span
+                    key={`hero-alias-${row.key}`}
+                    className={`team-identity-alias ${index === 0 ? 'is-current' : ''}`}
+                    title={`${row.name} · ${pluralize(row.registrationCount, 'registration')} · ${pluralize(row.totalMatches, 'match')}`}
+                  >
+                    {row.name}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          {warning ? (
+            <p className="team-missing-note team-warning-note" role="status">{warning}</p>
           ) : null}
-
-          <div className="analytics-cards team-summary-grid analytics-stats">
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Win rate</span>
-              <span className="analytics-card-value stat-value">{pct(effectiveSummary?.win_rate ?? teamLab?.match_summary?.win_rate)}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Last active</span>
-              <span className="analytics-card-value stat-value">{lastActiveLabel}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Matches</span>
-              <span className="analytics-card-value stat-value">{primaryMatchCount}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Events</span>
-              <span className="analytics-card-value stat-value">{tournamentCount || 'n/a'}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Players used</span>
-              <span className="analytics-card-value stat-value">{uniquePlayerCount || 'n/a'}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Lineups used</span>
-              <span className="analytics-card-value stat-value">{distinctLineupCount || 'n/a'}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Core lineup share</span>
-              <span className="analytics-card-value stat-value">{Number.isFinite(topLineupShare) ? pct(topLineupShare) : 'n/a'}</span>
-            </article>
-            <article className="analytics-card stat">
-              <span className="analytics-card-label stat-label">Continuity</span>
-              <span className="analytics-card-value stat-value">{continuityHint}</span>
-            </article>
+          <div className="team-stats-stack team-summary-grid analytics-stats">
+            <section className="team-stat-section" aria-label="Performance stats">
+              <p className="team-stat-section-label">Performance</p>
+              <div className="grid-cols-4 team-stat-grid">
+                {performanceStats.map((stat) => (
+                  <article key={`performance-${stat.label}`} className="analytics-card stat">
+                    <span className="analytics-card-label stat-label">{stat.label}</span>
+                    <span className="analytics-card-value stat-value">{stat.value}</span>
+                  </article>
+                ))}
+              </div>
+            </section>
+            <section className="team-stat-section" aria-label="Roster composition stats">
+              <p className="team-stat-section-label">Roster Composition</p>
+              <div className="grid-cols-4 team-stat-grid">
+                {rosterStats.map((stat) => (
+                  <article key={`roster-${stat.label}`} className="analytics-card stat">
+                    <span className="analytics-card-label stat-label">{stat.label}</span>
+                    <span className="analytics-card-value stat-value">{stat.value}</span>
+                  </article>
+                ))}
+              </div>
+            </section>
           </div>
 
           <div className="analytics-grid team-player-grid">
@@ -724,7 +881,7 @@ export default function TeamExplorer({
                 <div>
                   <h3>Core Roster</h3>
                   <p className="meta">
-                    Player usage ordered by match presence across the current roster family.
+                    Player usage ordered by match presence across the current team scope.
                   </p>
                 </div>
               </div>
@@ -734,36 +891,41 @@ export default function TeamExplorer({
                     const share = playerBaselineMatches > 0
                       ? Math.round((player.matchesPlayed / playerBaselineMatches) * 100)
                       : 0;
-                    const role = playerRole(player, playerBaselineMatches, index);
-                    const roleKey = role.toLowerCase().replace(/\s+/g, '-');
+                    const usageDescriptor = playerUsageDescriptor(player, playerBaselineMatches, index);
+                    const matchesLabel = player.matchesPlayed > 0
+                      ? pluralize(player.matchesPlayed, 'match')
+                      : 'top-lineup only';
                     return (
-                      <li key={`team-player-${player.id ?? player.name}`} className="team-roster-row">
-                        <div className="team-roster-name">
-                          <span>{player.name}</span>
-                          <span className={`team-roster-role is-${roleKey}`}>{role}</span>
-                        </div>
-                        <span className="team-roster-matches">
-                          {player.matchesPlayed > 0 ? player.matchesPlayed : '—'}
-                        </span>
-                        <div className="team-roster-bar" aria-hidden="true">
-                          <span style={{ width: `${Math.max(0, Math.min(share, 100))}%` }} />
-                        </div>
-                        <span className="team-roster-share">
-                          {player.matchesPlayed > 0 ? `${share}%` : 'n/a'}
-                        </span>
-                        <div className="team-compact-actions team-roster-actions">
-                          <button
-                            type="button"
-                            className="button button-secondary team-compact-button"
-                            disabled={player.id === null}
-                            onClick={() => onOpenPlayerLookup(player.id, player.name)}
-                            aria-label={`Open player history for ${player.name}`}
-                          >
-                            History
-                          </button>
+                      <li
+                        key={`team-player-${player.id ?? player.name}`}
+                        className={`team-roster-row ${player.id === null ? 'is-disabled' : ''}`}
+                      >
+                        <button
+                          type="button"
+                          className="team-row-primary team-roster-primary"
+                          disabled={player.id === null}
+                          onClick={() => onOpenPlayerLookup(player.id, player.name)}
+                          aria-label={`Open player history for ${player.name}`}
+                        >
+                          <span className="team-roster-main">
+                            <span className="team-roster-name">{player.name}</span>
+                            <span className="team-roster-note">
+                              {matchesLabel} · {usageDescriptor}
+                            </span>
+                          </span>
+                          <span className="team-roster-visual">
+                            <span className="team-roster-bar" aria-hidden="true">
+                              <span style={{ width: `${Math.max(0, Math.min(share, 100))}%` }} />
+                            </span>
+                            <span className="team-roster-share">
+                              {player.matchesPlayed > 0 ? `${share}%` : 'n/a'}
+                            </span>
+                          </span>
+                        </button>
+                        <div className="team-hover-actions">
                           {player.sendouUrl ? (
                             <a
-                              className="button button-secondary team-compact-button"
+                              className="team-hover-action"
                               href={player.sendouUrl}
                               target="_blank"
                               rel="noreferrer"
@@ -783,25 +945,35 @@ export default function TeamExplorer({
             </article>
 
             <article className="analytics-panel">
-              <h3>Top Lineup</h3>
-              <p className="meta">
-                {teamProfile?.top_lineup_summary || 'Current lineup summary unavailable.'}
-              </p>
-              <div className="team-player-chip-grid">
+              <div className="team-section-heading team-side-heading">
+                <div>
+                  <h3>Most-Used Lineup</h3>
+                  <p className="meta">Sorted to match the roster usage order.</p>
+                </div>
+              </div>
+              {topLineupPlayers.length ? (
+                <div className="team-top-lineup-summary">
+                  <p className="team-top-lineup-names">{topLineupPlayers.map((player) => player.name).join(' · ')}</p>
+                  <p className={`meta ${lineupSupportMismatch ? 'team-lineup-meta-warning' : ''}`}>{topLineupMeta}</p>
+                </div>
+              ) : (
+                <p className="meta">
+                  {teamProfile?.top_lineup_summary || 'Current lineup summary unavailable.'}
+                </p>
+              )}
+              <div className="team-lineup-strip" role="list" aria-label="Most-used lineup players">
                 {topLineupPlayers.length ? topLineupPlayers.map((player) => (
                   <button
                     key={`top-lineup-${player.id ?? player.name}`}
                     type="button"
-                    className="team-player-chip"
+                    className="team-lineup-chip"
                     disabled={player.id === null}
+                    role="listitem"
                     onClick={() => {
                       if (player.id !== null) onOpenPlayerLookup(player.id, player.name);
                     }}
                   >
-                    <span className="team-player-chip-name">{player.name}</span>
-                    <span className="team-player-chip-meta">
-                      {player.matchesPlayed > 0 ? `${player.matchesPlayed} matches` : 'Open player history'}
-                    </span>
+                    {player.name}
                   </button>
                 )) : (
                   <p className="meta">No top-lineup player list available.</p>
@@ -809,20 +981,22 @@ export default function TeamExplorer({
               </div>
 
               <div className="team-rotation-block">
-                <h4>Supporting Players</h4>
+                <h4>Subs</h4>
                 {rotationPlayers.length ? (
                   <ul className="team-rotation-list">
                     {rotationPlayers.map((player) => (
                       <li key={`rotation-${player.id ?? player.name}`}>
                         <span>{player.name}</span>
                         <span className="meta">
-                          {player.matchesPlayed > 0 ? `${player.matchesPlayed} matches` : 'lineup only'}
+                          {player.matchesPlayed > 0
+                            ? `${pluralize(player.matchesPlayed, 'match')} · ${pct(playerBaselineMatches > 0 ? player.matchesPlayed / playerBaselineMatches : null)}`
+                            : 'lineup only'}
                         </span>
                       </li>
                     ))}
                   </ul>
                 ) : (
-                  <p className="meta">No supporting players surfaced beyond the core four.</p>
+                  <p className="meta">No additional subs surfaced beyond the primary four.</p>
                 )}
               </div>
             </article>
@@ -831,15 +1005,41 @@ export default function TeamExplorer({
           <article className="analytics-panel analytics-panel-wide">
             <div className="team-section-heading">
               <div>
-                <h3>Recent Matches</h3>
+                <h3>History</h3>
                 <p className="meta">
-                  Match-by-match scouting log for this team family.
+                  Tournament-by-tournament match history for the currently loaded team scope.
                 </p>
               </div>
             </div>
+            <div className="team-history-toolbar">
+              <span className="team-history-legend">Ribbons run earliest on the left and latest on the right.</span>
+              {historyPageCount > 1 ? (
+                <div className="team-history-pagination">
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={historyPage <= 1}
+                    onClick={() => changeHistoryPage(historyPage - 1)}
+                  >
+                    Previous
+                  </button>
+                  <span className="team-history-pagination-meta">
+                    Page {historyPage} of {historyPageCount} · {pluralize(matchEvents.length, 'tournament')}
+                  </span>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={historyPage >= historyPageCount}
+                    onClick={() => changeHistoryPage(historyPage + 1)}
+                  >
+                    Next
+                  </button>
+                </div>
+              ) : null}
+            </div>
             {recentForm.length ? (
               <div className="team-form-strip" aria-label="Recent form">
-                <span className="team-form-label">Recent form</span>
+                <span className="team-form-label">Recent form, newest first</span>
                 <div className="team-form-pills">
                   {recentForm.map((row) => (
                     <span
@@ -855,42 +1055,102 @@ export default function TeamExplorer({
             ) : null}
             {matches.length ? (
               <div className="team-match-events">
-                {matchEvents.map((event) => (
-                  <section key={event.key} className="team-match-event">
-                    <header className="team-match-event-head">
-                      <div className="team-match-event-title">
-                        <span className="team-match-event-name">{event.tournamentName}</span>
-                        <span className="team-match-event-meta">
-                          {event.whenLabel} · {event.rows.length} match{event.rows.length === 1 ? '' : 'es'} · {event.wins}-{event.losses}
-                        </span>
-                      </div>
-                      <span className="team-match-event-tier">{event.tournamentTier || 'Unscored'}</span>
-                      <div className="team-match-event-ribbon" aria-label="Results ribbon">
-                        {event.rows.map((row) => (
-                          <span
-                            key={`ribbon-${row.key}`}
-                            className={`team-match-ribbon-cell ${row.tone}`}
-                            title={`${row.opponentTeamName}: ${row.scoreLabel}`}
-                          />
-                        ))}
-                      </div>
-                    </header>
-                    <div className="team-match-rows">
-                      {event.rows.map((row) => (
-                        <div key={row.key} className="team-match-row">
-                          <span className="team-match-date">{row.relativeDate}</span>
-                          <span className="team-match-opp">{row.opponentTeamName}</span>
-                          <span className="team-match-score">{row.scoreLabel}</span>
-                          <span className="team-match-roster">
-                            {row.teamRosterLabel}
-                            <br />
-                            <span className="meta">vs {row.opponentRosterLabel}</span>
+                {visibleMatchEvents.map((event) => {
+                  const isExpanded = expandedEventKeys.includes(event.key);
+                  return (
+                    <section key={event.key} className={`team-match-event ${isExpanded ? 'is-expanded' : ''}`}>
+                      <button
+                        type="button"
+                        className="team-match-event-head team-match-event-toggle"
+                        aria-expanded={isExpanded}
+                        onClick={() => toggleEventKey(event.key)}
+                      >
+                        <div className="team-match-event-title">
+                          <span className="team-match-event-name">{event.tournamentName}</span>
+                          <span className="team-match-event-meta">
+                            {event.whenLabel} · {pluralize(event.rows.length, 'match')} · {event.wins}-{event.losses}
+                            {event.opponentSummary ? ` · vs ${event.opponentSummary}` : ''}
                           </span>
-                          <span className={`team-result-pill ${row.tone}`}>{row.resultLabel}</span>
-                          <div className="team-row-actions">
+                        </div>
+                        <span className="team-match-event-tier">{event.tournamentTier || 'Unscored'}</span>
+                        <div className="team-match-event-progress">
+                          <div
+                            className="team-match-event-ribbon"
+                            aria-label="Tournament progression ribbon, earliest match on the left and latest on the right"
+                            title="Tournament progression, earliest match on the left and latest on the right."
+                            style={{ gridTemplateColumns: `repeat(${Math.max(event.ribbonRows?.length || 0, 1)}, minmax(0, 1fr))` }}
+                          >
+                            {(event.ribbonRows || []).map((row) => (
+                              <span
+                                key={`ribbon-${row.key}`}
+                                className={`team-match-ribbon-cell ${row.tone}`}
+                                title={`${row.opponentTeamName}: ${row.scoreLabel}`}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        <span className="team-match-event-chevron" aria-hidden="true">{isExpanded ? '▾' : '▸'}</span>
+                      </button>
+                      {isExpanded ? (
+                        <ul className="team-match-rows">
+                          {event.rows.map((row) => (
+                        <li
+                          key={row.key}
+                          className={`team-match-row ${row.opponentTeamId ? '' : 'is-disabled'}`}
+                        >
+                          <button
+                            type="button"
+                            className="team-row-primary team-match-primary"
+                            disabled={!row.opponentTeamId}
+                            onClick={() => onOpenTeamPage(
+                              row.opponentTeamId ? [row.opponentTeamId] : [],
+                              row.opponentTeamName,
+                              actionSnapshotId,
+                            )}
+                            aria-label={`Open team page for ${row.opponentTeamName}`}
+                          >
+                            <span className="team-match-row-top">
+                              <span className="team-match-date">{row.relativeDate}</span>
+                              <span className="team-match-opponent-block">
+                                <span className="team-match-opp">{row.opponentTeamName}</span>
+                                {row.opponentEventCount > 1 ? (
+                                  <span className="team-match-opponent-note">
+                                    {pluralize(row.opponentEventCount, 'meeting')} in this event
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className={`team-result-pill ${row.tone}`}>{row.resultLabel}</span>
+                              <span className="team-match-score">{row.scoreLabel}</span>
+                            </span>
+                            <span className="team-match-row-bottom">
+                              <span className="team-match-roster-group">
+                                <span className="team-match-roster-label">vs</span>
+                                <span className="team-match-roster-chips">
+                                  {row.opponentRosterPlayers.length ? row.opponentRosterPlayers.map((name) => (
+                                    <span key={`${row.key}-opp-${name}`} className="team-match-roster-chip">{name}</span>
+                                  )) : (
+                                    <span className="team-match-roster-chip is-muted">Roster unavailable</span>
+                                  )}
+                                </span>
+                              </span>
+                              {!row.usesDefaultTeamRoster ? (
+                                <span className="team-match-roster-group is-owned">
+                                  <span className="team-match-roster-label">Tracked</span>
+                                  <span className="team-match-roster-chips">
+                                    {row.teamRosterPlayers.length ? row.teamRosterPlayers.map((name) => (
+                                      <span key={`${row.key}-team-${name}`} className="team-match-roster-chip is-owned">{name}</span>
+                                    )) : (
+                                      <span className="team-match-roster-chip is-muted">Roster unavailable</span>
+                                    )}
+                                  </span>
+                                </span>
+                              ) : null}
+                            </span>
+                          </button>
+                          <div className="team-hover-actions">
                             <button
                               type="button"
-                              className="button button-secondary"
+                              className="team-hover-action"
                               disabled={!row.opponentTeamId}
                               onClick={() => onOpenHeadToHead(
                                 selectedFamilyIds,
@@ -900,24 +1160,14 @@ export default function TeamExplorer({
                             >
                               Compare
                             </button>
-                            <button
-                              type="button"
-                              className="button button-secondary"
-                              disabled={!row.opponentTeamId}
-                              onClick={() => onOpenTeamPage(
-                                row.opponentTeamId ? [row.opponentTeamId] : [],
-                                row.opponentTeamName,
-                                actionSnapshotId,
-                              )}
-                            >
-                              Open
-                            </button>
                           </div>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                ))}
+                        </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </section>
+                  );
+                })}
               </div>
             ) : (
               <p className="team-missing-note">
@@ -926,85 +1176,94 @@ export default function TeamExplorer({
             )}
           </article>
 
-          <div className="analytics-grid">
-            <article className="analytics-panel">
-              <div className="team-section-heading">
-                <div>
-                  <h3>Event Timeline</h3>
-                  <p className="meta">
-                    Consolidated names used by this roster family, ordered by last appearance.
-                  </p>
-                </div>
+          <article className="analytics-panel analytics-panel-wide">
+            <div className="team-section-heading">
+              <div>
+                <h3>Comparable Teams</h3>
+                <p className="meta">Similarity and tracked lineup volume from the current search snapshot.</p>
               </div>
-              <div className="table-wrap">
-                <table className="analytics-table">
-                  <thead>
-                    <tr>
-                      <th>Last seen</th>
-                      <th>Name</th>
-                      <th>Registrations</th>
-                      <th>Matches</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {nameTimelineRows.length ? nameTimelineRows.map((row) => (
-                      <tr key={`registration-${row.key}`}>
-                        <td title={fmtDate(row.latestEventTimeMs)}>{row.latestEventTimeMs ? relativeDate(row.latestEventTimeMs) : 'n/a'}</td>
-                        <td className="analytics-team-name">{row.name}</td>
-                        <td>{row.registrationCount}</td>
-                        <td>{row.totalMatches}</td>
-                      </tr>
-                    )) : (
-                      <tr>
-                        <td colSpan={4} className="table-empty-cell">No registration history available yet.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </article>
+            </div>
+            {comparableRows.length ? (
+              <ul className="team-compare-list">
+                {comparableRows.map((row) => {
+                  const similarity = Math.max(0, Math.min(Number(row.sim_to_query || 0) * 100, 100));
+                  const duplicateNameCount = comparableNameCounts.get(normalizeTimelineName(row.team_name)) || 0;
+                  const comparableMeta = [
+                    `${pct(row.sim_to_query)} similar`,
+                    Number.isFinite(Number(row.lineup_count))
+                      ? `${pluralize(row.lineup_count, 'tracked lineup')}`
+                      : null,
+                    duplicateNameCount > 1 ? 'same-name variant' : null,
+                  ].filter(Boolean).join(' · ');
 
-            <article className="analytics-panel">
-              <div className="team-section-heading">
-                <div>
-                  <h3>Comparable Teams</h3>
-                  <p className="meta">Teams with similar roster construction and lineup usage. Volume reflects indexed observations, not distinct lineups.</p>
-                </div>
-              </div>
-              {comparableRows.length ? (
-                <ul className="team-compare-list">
-                  {comparableRows.map((row) => (
+                  return (
                     <li key={`team-neighbor-${row.team_id}`} className="team-compare-row">
-                      <span className="team-compare-name">{row.team_name}</span>
-                      <div className="team-compare-match" aria-hidden="true">
-                        <span style={{ width: `${Math.max(0, Math.min(Number(row.sim_to_query || 0) * 100, 100))}%` }} />
-                      </div>
-                      <span className="team-compare-pct">{pct(row.sim_to_query)}</span>
-                      <span className="team-compare-lineups">{row.lineup_count ?? 'n/a'} observations</span>
-                      <div className="team-compact-actions">
+                      <button
+                        type="button"
+                        className="team-row-primary team-compare-primary"
+                        onClick={() => onOpenTeamPage([row.team_id], row.team_name, actionSnapshotId)}
+                        aria-label={`Open team page for ${row.team_name}`}
+                        title={`Team ID ${row.team_id}`}
+                      >
+                        <span className="team-compare-main">
+                          <span className="team-compare-name">{row.team_name}</span>
+                          <span className="team-compare-meta">{comparableMeta || 'Comparable roster profile'}</span>
+                        </span>
+                        <span className="team-compare-visual">
+                          <span className="team-compare-match" aria-hidden="true">
+                            <span style={{ width: `${similarity}%` }} />
+                          </span>
+                          <span className="team-compare-pct">{pct(row.sim_to_query)}</span>
+                        </span>
+                      </button>
+                      <div className="team-hover-actions">
                         <button
                           type="button"
-                          className="button button-secondary team-compact-button"
+                          className="team-hover-action"
                           onClick={() => onOpenHeadToHead(selectedFamilyIds, [row.team_id], actionSnapshotId)}
                         >
                           Compare
                         </button>
-                        <button
-                          type="button"
-                          className="button button-secondary team-compact-button"
-                          onClick={() => onOpenTeamPage([row.team_id], row.team_name, actionSnapshotId)}
-                        >
-                          Open
-                        </button>
                       </div>
                     </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="team-missing-note">No comparable teams loaded yet.</p>
-              )}
-            </article>
-          </div>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="team-missing-note">No comparable teams loaded yet.</p>
+            )}
+          </article>
+
+          {nameTimelineRows.length ? (
+            <div className="team-alias-strip">
+              <div className="team-alias-head">
+                <p className="team-alias-kicker">
+                  Name history{teamScope === 'family' ? ` · family of ${selectedFamilyIds.length}` : ''}
+                </p>
+                <span className="team-alias-meta">Newest first · registrations · matches</span>
+              </div>
+              <div className="team-alias-rail">
+                {nameTimelineRows.map((row, index) => {
+                  const isCurrent = index === 0;
+                  return (
+                    <div
+                      key={`team-alias-${row.key}`}
+                      className={`team-alias-item ${isCurrent ? 'is-current' : ''}`}
+                      title={`${row.name} · ${pluralize(row.registrationCount, 'registration')} · ${pluralize(row.totalMatches, 'match')}`}
+                    >
+                      <div className="team-alias-name">{row.name}</div>
+                      <div className="team-alias-date">
+                        {row.latestEventTimeMs ? relativeDate(row.latestEventTimeMs) : 'n/a'}
+                      </div>
+                      <div className="team-alias-matches">
+                        {pluralize(row.registrationCount, 'registration')} · {pluralize(row.totalMatches, 'match')}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
         </>
       ) : null}
     </section>

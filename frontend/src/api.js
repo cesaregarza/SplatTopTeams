@@ -2,6 +2,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || '';
 const TEAM_MATCHES_FALLBACK_BASE = import.meta.env.VITE_MATCHES_API_BASE
   || (import.meta.env.DEV ? '/__splat_top_api' : 'https://splat.top');
 const TRANSIENT_GATEWAY_STATUSES = new Set([502, 503, 504]);
+const MAX_TRANSIENT_RETRIES = 2;
 
 function replaceFamilyClusterMode(path) {
   const queryStart = path.indexOf('?');
@@ -62,6 +63,12 @@ function friendlyErrorMessage(path, status, text) {
     if (path.startsWith('/api/team-search')) {
       return 'Team search is temporarily unavailable. Try again in a moment.';
     }
+    if (path.startsWith('/api/analytics/team/')) {
+      if (path.includes('/matches')) {
+        return 'Recent match data is temporarily unavailable. Try again in a moment.';
+      }
+      return 'Team detail is temporarily unavailable. Try again in a moment.';
+    }
     return 'The API is temporarily unavailable. Try again in a moment.';
   }
   return text || `Request failed: ${status}`;
@@ -93,8 +100,8 @@ async function requestJsonWithBase(path, base = API_BASE, options = {}, attempt 
       return requestJsonWithBase(fallbackPath, base, options, attempt);
     }
 
-    if (attempt < 1 && isSafeRetryMethod(options.method) && TRANSIENT_GATEWAY_STATUSES.has(response.status)) {
-      await wait(250);
+    if (attempt < MAX_TRANSIENT_RETRIES && isSafeRetryMethod(options.method) && TRANSIENT_GATEWAY_STATUSES.has(response.status)) {
+      await wait(250 * (attempt + 1));
       return requestJsonWithBase(path, base, options, attempt + 1);
     }
 
