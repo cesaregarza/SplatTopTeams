@@ -8,6 +8,7 @@ import { TeamStatsSections } from './teamExplorer/TeamStatsSections';
 import {
   DEFAULT_TEAM_SCOPE,
   EMPTY_TEAM_IDS,
+  parseTeamIdList,
 } from './teamExplorer/helpers';
 import { useTeamExplorerData } from './teamExplorer/useTeamExplorerData';
 
@@ -16,6 +17,8 @@ export default function TeamExplorer({
   selectedTeamIds = EMPTY_TEAM_IDS,
   selectedSnapshotId = '',
   selectedTeamName = '',
+  initialTeamScope = DEFAULT_TEAM_SCOPE,
+  onStateChange = () => {},
   onOpenHeadToHead = () => {},
   onOpenTeamPage = () => {},
   onOpenPlayerLookup = () => {},
@@ -25,7 +28,23 @@ export default function TeamExplorer({
     selectedTeamIds,
     selectedSnapshotId,
     selectedTeamName,
+    initialTeamScope,
   });
+
+  function updateRoute(nextScope = data.teamScope) {
+    const nextTeamIds = parseTeamIdList(data.teamIdsInput);
+    if (!nextTeamIds.length) return;
+    onStateChange({
+      teamIds: nextTeamIds,
+      scope: nextScope,
+      snapshotId: data.normalizedSelectedSnapshotId,
+    });
+  }
+
+  async function handleSubmit(event) {
+    updateRoute();
+    await data.submitTeam(event);
+  }
 
   return (
     <section className="panel team-detail-panel" aria-labelledby="team-detail-title">
@@ -39,7 +58,7 @@ export default function TeamExplorer({
         </div>
       </div>
 
-      <form className="team-explorer-toolbar" onSubmit={data.submitTeam}>
+      <form className="team-explorer-toolbar" onSubmit={handleSubmit}>
         <div className="field team-id-field">
           <label className="field-label" htmlFor="team-detail-ids">Team ID or IDs</label>
           <input
@@ -66,7 +85,10 @@ export default function TeamExplorer({
               role="tab"
               aria-selected={data.teamScope === 'family'}
               className={data.teamScope === 'family' ? 'is-on' : ''}
-              onClick={() => data.setTeamScope('family')}
+              onClick={() => {
+                data.setTeamScope('family');
+                updateRoute('family');
+              }}
             >
               Family
             </button>
@@ -75,7 +97,10 @@ export default function TeamExplorer({
               role="tab"
               aria-selected={data.teamScope === 'individual'}
               className={data.teamScope === 'individual' ? 'is-on' : ''}
-              onClick={() => data.setTeamScope('individual')}
+              onClick={() => {
+                data.setTeamScope('individual');
+                updateRoute('individual');
+              }}
             >
               Individual
             </button>

@@ -1,4 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Navigate,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom';
 import AdvancedAnalytics from './components/AdvancedAnalytics';
 import { fetchHealth } from './api';
 import ClusterExplorer from './components/ClusterExplorer';
@@ -6,40 +16,18 @@ import HeadToHead from './components/HeadToHead';
 import PlayerLookup from './components/PlayerLookup';
 import TeamExplorer from './components/TeamExplorer';
 import TeamSearch from './components/TeamSearch';
-
-function parseTeamIds(value) {
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => Number(item))
-      .filter((item) => Number.isFinite(item) && item > 0)
-      .map((item) => Math.trunc(item));
-  }
-  const parsed = Number(value);
-  if (Number.isFinite(parsed) && parsed > 0) {
-    return [Math.trunc(parsed)];
-  }
-  if (typeof value === 'string') {
-    return value
-      .split(',')
-      .map((item) => item.trim())
-      .map((item) => Number(item))
-      .filter((item) => Number.isFinite(item) && item > 0)
-      .map((item) => Math.trunc(item));
-  }
-  return [];
-}
-
-function uniqueTeamIds(values) {
-  const seen = new Set();
-  const out = [];
-  for (const value of values) {
-    if (value > 0 && !seen.has(value)) {
-      seen.add(value);
-      out.push(value);
-    }
-  }
-  return out;
-}
+import {
+  buildClusterHref,
+  buildHeadToHeadHref,
+  buildPlayerHref,
+  buildSearchHref,
+  buildTeamHref,
+  parseClusterRouteState,
+  parseHeadToHeadRouteState,
+  parsePlayerRouteState,
+  parseSearchRouteState,
+  parseTeamRouteState,
+} from './routerState';
 
 function formatSnapshotStamp(value) {
   if (!value) return 'No completed snapshot';
@@ -54,32 +42,198 @@ function formatSnapshotStamp(value) {
   });
 }
 
+function routeLabel(pathname) {
+  if (pathname.startsWith('/teams')) return 'Teams';
+  if (pathname.startsWith('/players')) return 'Players';
+  if (pathname.startsWith('/head-to-head')) return 'Head-to-Head';
+  if (pathname.startsWith('/clusters')) return 'Clusters';
+  if (pathname.startsWith('/analytics')) return 'Analytics';
+  return 'Search';
+}
+
+function SearchRoute() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const routeState = useMemo(() => parseSearchRouteState(searchParams), [searchParams]);
+
+  return (
+    <TeamSearch
+      selectedTeamAIds={routeState.teamAIds}
+      selectedTeamBIds={routeState.teamBIds}
+      selectedSnapshotId={routeState.snapshotId}
+      initialRouteState={routeState}
+      onSearchStateChange={(nextState) => {
+        navigate(buildSearchHref({
+          ...routeState,
+          ...nextState,
+        }));
+      }}
+      onOpenTeamPage={(teamIds, _teamName, snapshotId) => {
+        navigate(buildTeamHref({ teamIds, snapshotId }));
+      }}
+      onOpenHeadToHead={(role, teamIds, snapshotId) => {
+        const nextIds = Array.isArray(teamIds) ? teamIds : [];
+        const nextTeamAIds = role === 'A' ? nextIds : routeState.teamAIds;
+        const nextTeamBIds = role === 'B' ? nextIds : routeState.teamBIds;
+        const sanitizedTeamAIds = nextTeamAIds.filter((teamId) => !nextTeamBIds.includes(teamId));
+        const sanitizedTeamBIds = nextTeamBIds.filter((teamId) => !sanitizedTeamAIds.includes(teamId));
+        navigate(buildSearchHref({
+          ...routeState,
+          teamAIds: sanitizedTeamAIds,
+          teamBIds: sanitizedTeamBIds,
+          snapshotId: snapshotId || routeState.snapshotId,
+        }));
+      }}
+      onOpenHeadToHeadPage={(teamAIds, teamBIds, snapshotId) => {
+        navigate(buildHeadToHeadHref({
+          teamAIds,
+          teamBIds,
+          snapshotId,
+        }));
+      }}
+    />
+  );
+}
+
+function TeamsRoute() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const params = useParams();
+  const [searchParams] = useSearchParams();
+  const routeState = useMemo(
+    () => parseTeamRouteState(params.teamId, searchParams),
+    [params.teamId, searchParams],
+  );
+
+  if (!params.teamId && routeState.teamIds.length) {
+    return <Navigate to={buildTeamHref(routeState)} replace />;
+  }
+
+  return (
+    <TeamExplorer
+      key={`${location.pathname}${location.search}`}
+      selectedTeamId={routeState.teamId}
+      selectedTeamIds={routeState.teamIds}
+      selectedSnapshotId={routeState.snapshotId}
+      initialTeamScope={routeState.scope}
+      onStateChange={(nextState) => {
+        navigate(buildTeamHref(nextState));
+      }}
+      onOpenHeadToHead={(teamAIds, teamBIds, snapshotId) => {
+        navigate(buildHeadToHeadHref({ teamAIds, teamBIds, snapshotId }));
+      }}
+      onOpenTeamPage={(teamIds, _teamName, snapshotId) => {
+        navigate(buildTeamHref({ teamIds, snapshotId }));
+      }}
+      onOpenPlayerLookup={(playerId, playerName) => {
+        navigate(buildPlayerHref({ playerId, playerName }));
+      }}
+    />
+  );
+}
+
+function PlayersRoute() {
+  const navigate = useNavigate();
+  const params = useParams();
+  const [searchParams] = useSearchParams();
+  const routeState = useMemo(
+    () => parsePlayerRouteState(params.playerId, searchParams),
+    [params.playerId, searchParams],
+  );
+
+  return (
+    <PlayerLookup
+      selectedPlayerId={routeState.playerId}
+      selectedPlayerName={routeState.playerName}
+      onOpenPlayerPage={(playerId, playerName) => {
+        navigate(buildPlayerHref({ playerId, playerName }));
+      }}
+      onOpenTeamSearch={(teamName) => {
+        navigate(buildSearchHref({ q: teamName }));
+      }}
+    />
+  );
+}
+
+function HeadToHeadRoute() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const routeState = useMemo(
+    () => parseHeadToHeadRouteState(searchParams),
+    [searchParams],
+  );
+
+  return (
+    <HeadToHead
+      selectedTeamAId={routeState.teamAId}
+      selectedTeamBId={routeState.teamBId}
+      selectedTeamAIds={routeState.teamAIds}
+      selectedTeamBIds={routeState.teamBIds}
+      selectedSnapshotId={routeState.snapshotId}
+      onStateChange={(nextState) => {
+        navigate(buildHeadToHeadHref(nextState));
+      }}
+      onSelectTeamA={(teamIds, snapshotId) => {
+        navigate(buildHeadToHeadHref({
+          teamAIds: teamIds,
+          teamBIds: routeState.teamBIds,
+          snapshotId: snapshotId || routeState.snapshotId,
+        }));
+      }}
+      onSelectTeamB={(teamIds, snapshotId) => {
+        navigate(buildHeadToHeadHref({
+          teamAIds: routeState.teamAIds,
+          teamBIds: teamIds,
+          snapshotId: snapshotId || routeState.snapshotId,
+        }));
+      }}
+    />
+  );
+}
+
+function ClustersRoute() {
+  const navigate = useNavigate();
+  const params = useParams();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const routeState = useMemo(
+    () => parseClusterRouteState(params.clusterId, searchParams),
+    [params.clusterId, searchParams],
+  );
+
+  if (!params.clusterId && routeState.clusterId) {
+    return <Navigate to={buildClusterHref(routeState)} replace />;
+  }
+
+  return (
+    <ClusterExplorer
+      key={`${location.pathname}${location.search}`}
+      initialQuery={routeState.query}
+      initialClusterMode={routeState.clusterMode}
+      initialLimit={routeState.limit}
+      initialSelectedClusterId={routeState.clusterId}
+      onStateChange={(nextState) => {
+        navigate(buildClusterHref(nextState));
+      }}
+    />
+  );
+}
+
 export default function App() {
-  const [tab, setTab] = useState('search');
+  const location = useLocation();
   const [health, setHealth] = useState(null);
-  const [headToHeadTeamAId, setHeadToHeadTeamAId] = useState('');
-  const [headToHeadTeamBId, setHeadToHeadTeamBId] = useState('');
-  const [headToHeadTeamAIds, setHeadToHeadTeamAIds] = useState([]);
-  const [headToHeadTeamBIds, setHeadToHeadTeamBIds] = useState([]);
-  const [headToHeadSnapshotId, setHeadToHeadSnapshotId] = useState('');
-  const [selectedTeamProfileId, setSelectedTeamProfileId] = useState('');
-  const [selectedTeamProfileIds, setSelectedTeamProfileIds] = useState([]);
-  const [selectedTeamProfileName, setSelectedTeamProfileName] = useState('');
-  const [selectedTeamProfileSnapshotId, setSelectedTeamProfileSnapshotId] = useState('');
-  const [selectedPlayerProfileId, setSelectedPlayerProfileId] = useState('');
-  const [selectedPlayerProfileName, setSelectedPlayerProfileName] = useState('');
 
   useEffect(() => {
     fetchHealth().then(setHealth).catch(() => setHealth(null));
   }, []);
 
   const tabs = useMemo(() => ([
-    { id: 'search', label: 'Team Search' },
-    { id: 'teams', label: 'Teams' },
-    { id: 'players', label: 'Player Lookup' },
-    { id: 'head-to-head', label: 'Head-to-Head' },
-    { id: 'clusters', label: 'Cluster Explorer' },
-    { id: 'analytics', label: 'Advanced Analytics' },
+    { id: 'search', label: 'Team Search', to: '/search' },
+    { id: 'teams', label: 'Teams', to: '/teams' },
+    { id: 'players', label: 'Player Lookup', to: '/players' },
+    { id: 'head-to-head', label: 'Head-to-Head', to: '/head-to-head' },
+    { id: 'clusters', label: 'Cluster Explorer', to: '/clusters' },
+    { id: 'analytics', label: 'Advanced Analytics', to: '/analytics' },
   ]), []);
 
   const latestSnapshot = health?.latest_snapshot || null;
@@ -88,75 +242,7 @@ export default function App() {
   const indexedTeamsLabel = Number.isFinite(indexedTeams)
     ? indexedTeams.toLocaleString()
     : 'n/a';
-
-  function pickHeadToHeadTeam(role, teamIds, snapshotId = null) {
-    const nextIds = uniqueTeamIds(parseTeamIds(teamIds));
-    const nextId = nextIds[0] ? String(nextIds[0]) : '';
-    const nextSet = new Set(nextIds);
-    if (snapshotId !== null && snapshotId !== undefined && String(snapshotId).trim() !== '') {
-      setHeadToHeadSnapshotId(String(snapshotId).trim());
-    }
-
-    if (role === 'A') {
-      setHeadToHeadTeamAId(nextId);
-      setHeadToHeadTeamAIds(nextIds);
-      if (nextId && nextId === headToHeadTeamBId) {
-        setHeadToHeadTeamBId('');
-        setHeadToHeadTeamBIds([]);
-      }
-      if (nextSet.size && headToHeadTeamBIds.some((teamId) => nextSet.has(teamId))) {
-        setHeadToHeadTeamBId('');
-        setHeadToHeadTeamBIds([]);
-      }
-      return;
-    }
-
-    setHeadToHeadTeamBId(nextId);
-    setHeadToHeadTeamBIds(nextIds);
-    if (nextId && nextId === headToHeadTeamAId) {
-      setHeadToHeadTeamAId('');
-      setHeadToHeadTeamAIds([]);
-    }
-    if (nextSet.size && headToHeadTeamAIds.some((teamId) => nextSet.has(teamId))) {
-      setHeadToHeadTeamAId('');
-      setHeadToHeadTeamAIds([]);
-    }
-  }
-
-  function openHeadToHeadPair(teamAIds, teamBIds, snapshotId = null) {
-    const nextTeamAIds = uniqueTeamIds(parseTeamIds(teamAIds));
-    const nextTeamBIds = uniqueTeamIds(parseTeamIds(teamBIds)).filter(
-      (teamId) => !nextTeamAIds.includes(teamId),
-    );
-
-    setHeadToHeadTeamAId(nextTeamAIds[0] ? String(nextTeamAIds[0]) : '');
-    setHeadToHeadTeamAIds(nextTeamAIds);
-    setHeadToHeadTeamBId(nextTeamBIds[0] ? String(nextTeamBIds[0]) : '');
-    setHeadToHeadTeamBIds(nextTeamBIds);
-    if (snapshotId !== null && snapshotId !== undefined && String(snapshotId).trim() !== '') {
-      setHeadToHeadSnapshotId(String(snapshotId).trim());
-    }
-    setTab('head-to-head');
-  }
-
-  function openTeamPage(teamIds, teamName = '', snapshotId = null) {
-    const nextIds = uniqueTeamIds(parseTeamIds(teamIds));
-    setSelectedTeamProfileId(nextIds[0] ? String(nextIds[0]) : '');
-    setSelectedTeamProfileIds(nextIds);
-    setSelectedTeamProfileName(String(teamName || '').trim());
-    if (snapshotId !== null && snapshotId !== undefined && String(snapshotId).trim() !== '') {
-      setSelectedTeamProfileSnapshotId(String(snapshotId).trim());
-    }
-    setTab('teams');
-  }
-
-  function openPlayerPage(playerId, playerName = '') {
-    const parsed = Number(playerId);
-    if (!Number.isFinite(parsed) || parsed <= 0) return;
-    setSelectedPlayerProfileId(String(Math.trunc(parsed)));
-    setSelectedPlayerProfileName(String(playerName || '').trim());
-    setTab('players');
-  }
+  const currentViewLabel = routeLabel(location.pathname);
 
   return (
     <div className="page-shell shell">
@@ -169,7 +255,7 @@ export default function App() {
                 <span className="crumb-divider" aria-hidden="true" />
                 <span className="crumb-parent">Discovery</span>
                 <span className="crumb-sep" aria-hidden="true">/</span>
-                <span className="crumb-current">Teams</span>
+                <span className="crumb-current">{currentViewLabel}</span>
               </div>
               <h1 className="hero-title">SplatTopTeams</h1>
               <p className="hero-sub">
@@ -219,78 +305,34 @@ export default function App() {
 
       <div className="subnav-wrap">
         <div className="container">
-          <div className="subnav-inner" role="tablist" aria-label="Primary views">
+          <nav className="subnav-inner" aria-label="Primary views">
             {tabs.map((item) => (
-              <button
+              <NavLink
                 key={item.id}
-                role="tab"
-                aria-selected={tab === item.id}
-                className={`subnav-link ${tab === item.id ? 'is-active' : ''}`}
-                onClick={() => setTab(item.id)}
+                to={item.to}
+                className={({ isActive }) => `subnav-link ${isActive ? 'is-active' : ''}`}
               >
                 {item.label}
-              </button>
+              </NavLink>
             ))}
-          </div>
+          </nav>
         </div>
       </div>
 
       <main className="site-main container">
-
-        {tab === 'search' ? (
-          <TeamSearch
-            selectedTeamAId={headToHeadTeamAId}
-            selectedTeamBId={headToHeadTeamBId}
-            selectedTeamAIds={headToHeadTeamAIds}
-            selectedTeamBIds={headToHeadTeamBIds}
-            onOpenTeamPage={(teamIds, teamName, snapshotId) => {
-              openTeamPage(teamIds, teamName, snapshotId);
-            }}
-            onOpenHeadToHead={(role, teamId, snapshotId) => {
-              pickHeadToHeadTeam(role, teamId, snapshotId);
-              setTab('head-to-head');
-            }}
-          />
-        ) : null}
-        {tab === 'teams' ? (
-          <TeamExplorer
-            selectedTeamId={selectedTeamProfileId}
-            selectedTeamIds={selectedTeamProfileIds}
-            selectedTeamName={selectedTeamProfileName}
-            selectedSnapshotId={selectedTeamProfileSnapshotId}
-            onOpenHeadToHead={(teamAIds, teamBIds, snapshotId) => {
-              openHeadToHeadPair(teamAIds, teamBIds, snapshotId);
-            }}
-            onOpenTeamPage={(teamIds, teamName, snapshotId) => {
-              openTeamPage(teamIds, teamName, snapshotId);
-            }}
-            onOpenPlayerLookup={(playerId, playerName) => {
-              openPlayerPage(playerId, playerName);
-            }}
-          />
-        ) : null}
-        {tab === 'players' ? (
-          <PlayerLookup
-            selectedPlayerId={selectedPlayerProfileId}
-            selectedPlayerName={selectedPlayerProfileName}
-            onOpenTeamSearch={(teamName) => {
-              setTab('search');
-            }}
-          />
-        ) : null}
-        {tab === 'head-to-head' ? (
-          <HeadToHead
-            selectedTeamAId={headToHeadTeamAId}
-            selectedTeamBId={headToHeadTeamBId}
-            selectedTeamAIds={headToHeadTeamAIds}
-            selectedTeamBIds={headToHeadTeamBIds}
-            selectedSnapshotId={headToHeadSnapshotId}
-            onSelectTeamA={(teamId, snapshotId) => pickHeadToHeadTeam('A', teamId, snapshotId)}
-            onSelectTeamB={(teamId, snapshotId) => pickHeadToHeadTeam('B', teamId, snapshotId)}
-          />
-        ) : null}
-        {tab === 'clusters' ? <ClusterExplorer /> : null}
-        {tab === 'analytics' ? <AdvancedAnalytics /> : null}
+        <Routes>
+          <Route path="/" element={<Navigate to="/search" replace />} />
+          <Route path="/search" element={<SearchRoute />} />
+          <Route path="/teams" element={<TeamsRoute />} />
+          <Route path="/teams/:teamId" element={<TeamsRoute />} />
+          <Route path="/players" element={<PlayersRoute />} />
+          <Route path="/players/:playerId" element={<PlayersRoute />} />
+          <Route path="/head-to-head" element={<HeadToHeadRoute />} />
+          <Route path="/clusters" element={<ClustersRoute />} />
+          <Route path="/clusters/:clusterId" element={<ClustersRoute />} />
+          <Route path="/analytics" element={<AdvancedAnalytics />} />
+          <Route path="*" element={<Navigate to="/search" replace />} />
+        </Routes>
       </main>
     </div>
   );

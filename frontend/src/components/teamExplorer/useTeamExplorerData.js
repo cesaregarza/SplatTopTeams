@@ -46,9 +46,10 @@ export function useTeamExplorerData({
   selectedTeamIds,
   selectedSnapshotId,
   selectedTeamName,
+  initialTeamScope = DEFAULT_TEAM_SCOPE,
 }) {
   const [teamIdsInput, setTeamIdsInput] = useState('');
-  const [teamScope, setTeamScope] = useState(DEFAULT_TEAM_SCOPE);
+  const [teamScope, setTeamScope] = useState(initialTeamScope);
   const [detailState, setDetailState] = useState(INITIAL_DETAIL_STATE);
   const [historyUi, setHistoryUi] = useState(INITIAL_HISTORY_UI);
   const previousScopeRef = useRef(DEFAULT_TEAM_SCOPE);

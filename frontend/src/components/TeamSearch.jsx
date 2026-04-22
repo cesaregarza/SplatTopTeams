@@ -1,5 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchTeamSearch, fetchTeamSuggestions, fetchTournamentTeams } from '../api';
+import {
+  DEFAULT_SEARCH_ROUTE_STATE,
+  normalizeSearchRouteState,
+  searchRouteSignature,
+} from '../routerState';
 
 const EMPTY_TEAM_IDS = [];
 
@@ -262,8 +267,12 @@ export default function TeamSearch({
   selectedTeamBId = '',
   selectedTeamAIds = EMPTY_TEAM_IDS,
   selectedTeamBIds = EMPTY_TEAM_IDS,
+  selectedSnapshotId = '',
+  initialRouteState = DEFAULT_SEARCH_ROUTE_STATE,
+  onSearchStateChange = () => {},
   onOpenTeamPage = () => {},
   onOpenHeadToHead = () => {},
+  onOpenHeadToHeadPage = () => {},
 }) {
   const [query, setQuery] = useState('');
   const [clusterMode, setClusterMode] = useState('family');
@@ -292,6 +301,7 @@ export default function TeamSearch({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const queryInputRef = useRef(null);
   const suppressSuggestionsRef = useRef(false);
+  const hydratedRouteSignatureRef = useRef('');
 
   const resultLabel = useMemo(() => {
     if (!payload) return 'No query yet.';
@@ -344,6 +354,79 @@ export default function TeamSearch({
     if (!Number.isFinite(parsed) || parsed <= 0) return null;
     return Math.trunc(parsed);
   }, [tournamentId]);
+  const selectedTeamAList = useMemo(
+    () => Array.from(selectedTeamAIdSet),
+    [selectedTeamAIdSet],
+  );
+  const selectedTeamBList = useMemo(
+    () => Array.from(selectedTeamBIdSet),
+    [selectedTeamBIdSet],
+  );
+  const canOpenHeadToHead = selectedTeamAList.length > 0 && selectedTeamBList.length > 0;
+  const normalizedRouteState = useMemo(
+    () => normalizeSearchRouteState(initialRouteState),
+    [initialRouteState],
+  );
+
+  const runSearch = useCallback(async (routeState) => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await fetchTeamSearch({
+        q: routeState.q,
+        topN: routeState.topN,
+        clusterMode: routeState.clusterMode,
+        minRelevance: routeState.minRelevance,
+        tournamentId: routeState.tournamentId || undefined,
+        seedPlayerIds: routeState.seedPlayerIds,
+        consolidate: routeState.consolidate,
+        consolidateMinOverlap: routeState.consolidateMinOverlap,
+        recencyWeight: routeState.recencyWeight,
+      });
+      setPayload(data);
+    } catch (err) {
+      setError(err.message || 'Failed to load results');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const nextSignature = searchRouteSignature(normalizedRouteState);
+    if (nextSignature === hydratedRouteSignatureRef.current) return;
+    hydratedRouteSignatureRef.current = nextSignature;
+
+    setQuery(normalizedRouteState.q);
+    setClusterMode(normalizedRouteState.clusterMode);
+    setTopN(normalizedRouteState.topN);
+    setMinRelevance(normalizedRouteState.minRelevance);
+    setConsolidate(normalizedRouteState.consolidate);
+    setConsolidateMinOverlap(normalizedRouteState.consolidateMinOverlap);
+    setRecencyWeight(normalizedRouteState.recencyWeight);
+    setTournamentId(normalizedRouteState.tournamentId);
+    setTournamentTeamLookup(normalizedRouteState.seedTeamName || '');
+    setSelectedTournamentSeedPlayerIds(normalizedRouteState.seedPlayerIds);
+    setSelectedTournamentSeedMeta(
+      normalizedRouteState.seedTeamName || normalizedRouteState.seedTeamId
+        ? {
+            teamName: normalizedRouteState.seedTeamName || (normalizedRouteState.seedTeamId
+              ? `Team ${normalizedRouteState.seedTeamId}`
+              : ''),
+            teamId: normalizedRouteState.seedTeamId,
+          }
+        : null,
+    );
+    setShowSuggestions(false);
+    setSuggestions([]);
+
+    if (normalizedRouteState.q) {
+      runSearch(normalizedRouteState);
+    } else {
+      setPayload(null);
+      setError('');
+      setLoading(false);
+    }
+  }, [normalizedRouteState, runSearch]);
 
   useEffect(() => {
     setSelectedTournamentSeedMeta(null);
@@ -500,29 +583,40 @@ export default function TeamSearch({
 
   async function onSubmit(event) {
     event.preventDefault();
-    if (!query.trim()) return;
+    const nextRouteState = normalizeSearchRouteState({
+      q,
+      clusterMode,
+      topN,
+      minRelevance,
+      consolidate,
+      consolidateMinOverlap,
+      recencyWeight,
+      tournamentId,
+      seedPlayerIds: selectedTournamentSeedPlayerIds,
+      seedTeamId: selectedTournamentSeedMeta?.teamId ?? null,
+      seedTeamName: selectedTournamentSeedMeta?.teamName ?? '',
+    });
+    if (!nextRouteState.q) return;
     suppressSuggestionsRef.current = true;
     setShowSuggestions(false);
-    setLoading(true);
-    setError('');
-    try {
-      const data = await fetchTeamSearch({
-        q: query.trim(),
-        topN,
-        clusterMode,
-        minRelevance,
-        tournamentId: parsedTournamentId ?? undefined,
-        seedPlayerIds: selectedTournamentSeedPlayerIds,
-        consolidate,
-        consolidateMinOverlap,
-        recencyWeight,
-      });
-      setPayload(data);
-    } catch (err) {
-      setError(err.message || 'Failed to load results');
-    } finally {
-      setLoading(false);
-    }
+    hydratedRouteSignatureRef.current = searchRouteSignature(nextRouteState);
+    onSearchStateChange(nextRouteState);
+    await runSearch(nextRouteState);
+  }
+
+  function sameSelection(selectedIds, nextIds) {
+    if (selectedIds.length !== nextIds.length) return false;
+    const selected = new Set(selectedIds);
+    return nextIds.every((teamId) => selected.has(teamId));
+  }
+
+  function toggleHeadToHeadSelection(role, teamIds, snapshotId) {
+    const nextIds = teamIds
+      .map((value) => safeIntOrNull(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const currentIds = role === 'A' ? selectedTeamAList : selectedTeamBList;
+    const shouldClear = sameSelection(currentIds, nextIds);
+    onOpenHeadToHead(role, shouldClear ? [] : nextIds, snapshotId || selectedSnapshotId || payload?.snapshot_id);
   }
 
   return (
@@ -826,6 +920,77 @@ export default function TeamSearch({
       <p className="status" role="status" aria-live="polite">{resultLabel}</p>
       {error ? <p className="error">{error}</p> : null}
 
+      {(selectedTeamAList.length > 0 || selectedTeamBList.length > 0) ? (
+        <section className="head-to-head-panel" aria-label="Search comparison staging">
+          <div className="results-head">
+            <div>
+              <h3 className="results-title">Comparison staging</h3>
+              <p className="results-subtitle">
+                Keep browsing search results, then open the matchup once both sides are set.
+              </p>
+            </div>
+            <div className="result-quick-actions">
+              <button
+                type="button"
+                className="result-select-btn"
+                onClick={() => onOpenHeadToHead('A', [], selectedSnapshotId || payload?.snapshot_id)}
+                disabled={!selectedTeamAList.length}
+              >
+                Clear Team A
+              </button>
+              <button
+                type="button"
+                className="result-select-btn"
+                onClick={() => onOpenHeadToHead('B', [], selectedSnapshotId || payload?.snapshot_id)}
+                disabled={!selectedTeamBList.length}
+              >
+                Clear Team B
+              </button>
+              <button
+                type="button"
+                className="button btn-pill btn-fuchsia"
+                onClick={() => onOpenHeadToHeadPage(
+                  selectedTeamAList,
+                  selectedTeamBList,
+                  selectedSnapshotId || payload?.snapshot_id,
+                )}
+                disabled={!canOpenHeadToHead}
+              >
+                Open head-to-head
+              </button>
+            </div>
+          </div>
+          <div className="grid-cols-2 h2h-team-pair">
+            <section className="h2h-team-card">
+              <header><h4>Team A</h4></header>
+              <p className="h2h-team-summary">
+                {selectedTeamAList.length
+                  ? `${selectedTeamAList.length} selected ID${selectedTeamAList.length === 1 ? '' : 's'}`
+                  : 'Nothing selected'}
+              </p>
+              <div className="h2h-id-list">
+                {selectedTeamAList.map((teamId) => (
+                  <span key={`search-a-${teamId}`} className="id-chip id-chip--compact">#{teamId}</span>
+                ))}
+              </div>
+            </section>
+            <section className="h2h-team-card">
+              <header><h4>Team B</h4></header>
+              <p className="h2h-team-summary">
+                {selectedTeamBList.length
+                  ? `${selectedTeamBList.length} selected ID${selectedTeamBList.length === 1 ? '' : 's'}`
+                  : 'Nothing selected'}
+              </p>
+              <div className="h2h-id-list">
+                {selectedTeamBList.map((teamId) => (
+                  <span key={`search-b-${teamId}`} className="id-chip id-chip--compact">#{teamId}</span>
+                ))}
+              </div>
+            </section>
+          </div>
+        </section>
+      ) : null}
+
       {payload && results.length === 0 && !loading && !error ? (
         <div className="empty-state" role="status">
           <p className="empty-state-title">No teams found for &ldquo;{query}&rdquo;</p>
@@ -1055,20 +1220,20 @@ export default function TeamSearch({
                     <button
                       type="button"
                       className={`result-select-btn ${isTeamASelected ? 'is-selected' : ''}`}
-                      onClick={() => onOpenHeadToHead('A', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
+                      onClick={() => toggleHeadToHeadSelection('A', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
                       aria-pressed={isTeamASelected}
                       title={isTeamASelected ? 'This is Team A' : 'Select this result as Team A'}
                     >
-                      {isTeamASelected ? 'Selected as Team A' : 'Select as Team A'}
+                      {isTeamASelected ? 'Clear Team A' : 'Select as Team A'}
                     </button>
                     <button
                       type="button"
                       className={`result-select-btn ${isTeamBSelected ? 'is-selected' : ''}`}
-                      onClick={() => onOpenHeadToHead('B', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
+                      onClick={() => toggleHeadToHeadSelection('B', row.consolidated_team_ids || [row.team_id], payload?.snapshot_id)}
                       aria-pressed={isTeamBSelected}
                       title={isTeamBSelected ? 'This is Team B' : 'Select this result as Team B'}
                     >
-                      {isTeamBSelected ? 'Selected as Team B' : 'Select as Team B'}
+                      {isTeamBSelected ? 'Clear Team B' : 'Select as Team B'}
                     </button>
                     <button
                       type="button"

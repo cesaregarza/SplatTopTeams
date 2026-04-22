@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchClusterDetail, fetchClusters } from '../api';
 
 function fmtDate(ms) {
@@ -8,7 +8,19 @@ function fmtDate(ms) {
   return new Date(seconds * 1000).toISOString().slice(0, 10);
 }
 
-export default function ClusterExplorer() {
+function parseClusterId(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.trunc(parsed);
+}
+
+export default function ClusterExplorer({
+  initialQuery = '',
+  initialClusterMode = 'explore',
+  initialLimit = 40,
+  initialSelectedClusterId = '',
+  onStateChange = () => {},
+}) {
   const [query, setQuery] = useState('');
   const [clusterMode, setClusterMode] = useState('explore');
   const [limit, setLimit] = useState(40);
@@ -17,29 +29,63 @@ export default function ClusterExplorer() {
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const preferredRouteClusterId = useMemo(
+    () => parseClusterId(initialSelectedClusterId),
+    [initialSelectedClusterId],
+  );
 
-  async function loadClusters() {
+  const loadClusters = useCallback(async ({
+    nextQuery = '',
+    nextClusterMode = 'explore',
+    nextLimit = 40,
+    preferredClusterId = null,
+  } = {}) => {
     setLoading(true);
     setError('');
     try {
-      const data = await fetchClusters({ q: query.trim(), clusterMode, limit });
-      setClusters(data.clusters || []);
-      if (data.clusters?.length) {
-        setSelected((current) => current ?? data.clusters[0].cluster_id);
-      } else {
-        setSelected(null);
-      }
+      const data = await fetchClusters({
+        q: String(nextQuery || '').trim(),
+        clusterMode: nextClusterMode,
+        limit: nextLimit,
+      });
+      const nextClusters = data.clusters || [];
+      setClusters(nextClusters);
+      setSelected((current) => {
+        if (preferredClusterId !== null) {
+          return preferredClusterId;
+        }
+        if (current !== null && nextClusters.some((cluster) => cluster.cluster_id === current)) {
+          return current;
+        }
+        return nextClusters.length ? nextClusters[0].cluster_id : null;
+      });
     } catch (err) {
       setError(err.message || 'Failed to load clusters');
+      setClusters([]);
+      setSelected(null);
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
-    loadClusters();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusterMode]);
+    setQuery(initialQuery);
+    setClusterMode(initialClusterMode);
+    setLimit(initialLimit);
+    setSelected(preferredRouteClusterId);
+    loadClusters({
+      nextQuery: initialQuery,
+      nextClusterMode: initialClusterMode,
+      nextLimit: initialLimit,
+      preferredClusterId: preferredRouteClusterId,
+    });
+  }, [
+    initialClusterMode,
+    initialLimit,
+    initialQuery,
+    loadClusters,
+    preferredRouteClusterId,
+  ]);
 
   useEffect(() => {
     async function loadDetail() {
@@ -58,6 +104,22 @@ export default function ClusterExplorer() {
     loadDetail();
   }, [selected, clusterMode]);
 
+  function handleRefresh(event) {
+    event.preventDefault();
+    onStateChange({
+      query,
+      clusterMode,
+      limit,
+      clusterId: selected ?? '',
+    });
+    loadClusters({
+      nextQuery: query,
+      nextClusterMode: clusterMode,
+      nextLimit: limit,
+      preferredClusterId: selected,
+    });
+  }
+
   return (
     <section className="panel" aria-labelledby="cluster-title">
       <div className="panel-head">
@@ -70,7 +132,7 @@ export default function ClusterExplorer() {
         </div>
       </div>
 
-      <div className="form-grid search-form">
+      <form className="form-grid search-form" onSubmit={handleRefresh}>
         <label htmlFor="cluster-filter" className="field-label">Cluster/team filter</label>
         <input
           id="cluster-filter"
@@ -110,10 +172,10 @@ export default function ClusterExplorer() {
           </div>
         </div>
 
-        <button className="button btn-pill btn-fuchsia" type="button" onClick={loadClusters} disabled={loading}>
+        <button className="button btn-pill btn-fuchsia" type="submit" disabled={loading}>
           {loading ? 'Refreshing…' : 'Refresh clusters'}
         </button>
-      </div>
+      </form>
 
       {error ? <p className="error">{error}</p> : null}
 
@@ -129,7 +191,15 @@ export default function ClusterExplorer() {
               key={cluster.cluster_id}
               type="button"
               className={`cluster-item ${selected === cluster.cluster_id ? 'is-active' : ''}`}
-              onClick={() => setSelected(cluster.cluster_id)}
+              onClick={() => {
+                setSelected(cluster.cluster_id);
+                onStateChange({
+                  query,
+                  clusterMode,
+                  limit,
+                  clusterId: cluster.cluster_id,
+                });
+              }}
               aria-selected={selected === cluster.cluster_id}
             >
               <span className="cluster-item-head">

@@ -4,6 +4,7 @@ import { fetchPlayerSuggestions, fetchPlayerTeams } from '../api';
 export default function PlayerLookup({
   selectedPlayerId = '',
   selectedPlayerName = '',
+  onOpenPlayerPage = () => {},
   onOpenTeamSearch,
 }) {
   const [query, setQuery] = useState('');
@@ -60,7 +61,7 @@ export default function PlayerLookup({
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
-  function selectPlayer(player) {
+  function selectPlayer(player, { syncRoute = true } = {}) {
     setSelectedPlayer(player);
     setQuery(player.display_name);
     setShowSuggestions(false);
@@ -68,6 +69,9 @@ export default function PlayerLookup({
     setLoading(true);
     setError('');
     setTeams([]);
+    if (syncRoute) {
+      onOpenPlayerPage(player.player_id, player.display_name);
+    }
 
     fetchPlayerTeams({ playerId: player.player_id })
       .then((data) => {
@@ -95,8 +99,8 @@ export default function PlayerLookup({
     selectPlayer({
       player_id: Math.trunc(playerId),
       display_name: nextName,
-    });
-  }, [selectedPlayer, selectedPlayerId, selectedPlayerName]);
+    }, { syncRoute: false });
+  }, [onOpenPlayerPage, selectedPlayer, selectedPlayerId, selectedPlayerName]);
 
   const sortedTeams = useMemo(() => {
     const list = [...teams];

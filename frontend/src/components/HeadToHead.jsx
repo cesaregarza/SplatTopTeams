@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAnalyticsHeadToHead, fetchTeamSearch } from '../api';
 
 function toEpochMs(ms) {
@@ -291,6 +291,7 @@ const MATCH_SORT_FIELDS = [
   { value: 'score|desc', label: 'Match score · A higher' },
   { value: 'score|asc', label: 'Match score · A lower' },
 ];
+const EMPTY_TEAM_IDS = [];
 
 function getTierOrderLabel(score, tierId) {
   const tier = resolveTournamentTier(score, tierId);
@@ -637,9 +638,10 @@ function compareMatchRows(rows, sortBy, direction) {
 export default function HeadToHead({
   selectedTeamAId = '',
   selectedTeamBId = '',
-  selectedTeamAIds = [],
-  selectedTeamBIds = [],
+  selectedTeamAIds = EMPTY_TEAM_IDS,
+  selectedTeamBIds = EMPTY_TEAM_IDS,
   selectedSnapshotId = '',
+  onStateChange = () => {},
   onSelectTeamA = () => {},
   onSelectTeamB = () => {},
 }) {
@@ -671,6 +673,7 @@ export default function HeadToHead({
   const [matchSortBy, setMatchSortBy] = useState('time');
   const [matchSortDir, setMatchSortDir] = useState('desc');
   const [lastHeadToHeadSignature, setLastHeadToHeadSignature] = useState('');
+  const lastAutoLoadedRouteKeyRef = useRef('');
   const visibleMatchSortFields = useMemo(
     () => (
       SHOW_MAP_RULESET_COLUMN
@@ -712,6 +715,24 @@ export default function HeadToHead({
   const teamBIds = useMemo(() => uniquePreserveOrder(parseTeamIdList(teamBInput)), [teamBInput]);
   const teamASet = useMemo(() => new Set(teamAIds), [teamAIds]);
   const teamBSet = useMemo(() => new Set(teamBIds), [teamBIds]);
+  const routeTeamAIds = useMemo(
+    () => uniquePreserveOrder([
+      ...parseTeamIdList(selectedTeamAIds),
+      ...parseTeamIdList(selectedTeamAId),
+    ]),
+    [selectedTeamAId, selectedTeamAIds],
+  );
+  const routeTeamBIds = useMemo(
+    () => uniquePreserveOrder([
+      ...parseTeamIdList(selectedTeamBIds),
+      ...parseTeamIdList(selectedTeamBId),
+    ]),
+    [selectedTeamBId, selectedTeamBIds],
+  );
+  const routeSnapshotId = useMemo(
+    () => safeIntOrNull(selectedSnapshotId),
+    [selectedSnapshotId],
+  );
   const isSelectionOverlap = useMemo(
     () => teamAIds.some((teamId) => teamBSet.has(teamId)),
     [teamAIds, teamBSet],
@@ -928,27 +949,83 @@ export default function HeadToHead({
 
   async function onRunHeadToHead(event) {
     event.preventDefault();
-    if (!canRunHeadToHead) return;
+    await runHeadToHead({ syncRoute: true });
+  }
+
+  const runHeadToHead = useCallback(async ({
+    teamAIdsOverride = teamAIds,
+    teamBIdsOverride = teamBIds,
+    snapshotIdOverride = headToHeadSnapshotFilter,
+    syncRoute = false,
+  } = {}) => {
+    const nextTeamAIds = uniquePreserveOrder(parseTeamIdList(teamAIdsOverride));
+    const nextTeamBIds = uniquePreserveOrder(parseTeamIdList(teamBIdsOverride));
+    const overlap = nextTeamAIds.some((teamId) => nextTeamBIds.includes(teamId));
+    if (!nextTeamAIds.length || !nextTeamBIds.length || overlap) {
+      return false;
+    }
+
+    const snapshotId = safeIntOrNull(snapshotIdOverride);
+    const routeKey = `A:${idsToText(nextTeamAIds)}|B:${idsToText(nextTeamBIds)}|S:${snapshotId || 'latest'}`;
+    const nextSignature = `A:${idsToText(nextTeamAIds)}|B:${idsToText(nextTeamBIds)}|S:${snapshotId || 'latest'}|N:${headToHeadLimit}`;
+
+    if (syncRoute) {
+      lastAutoLoadedRouteKeyRef.current = routeKey;
+      onStateChange({
+        teamAIds: nextTeamAIds,
+        teamBIds: nextTeamBIds,
+        snapshotId,
+      });
+    }
 
     setHeadToHeadLoading(true);
     setHeadToHeadError('');
     try {
       const payload = await fetchAnalyticsHeadToHead({
-        teamAIds,
-        teamBIds,
-        snapshotId: safeIntOrNull(headToHeadSnapshotFilter),
+        teamAIds: nextTeamAIds,
+        teamBIds: nextTeamBIds,
+        snapshotId,
         limit: headToHeadLimit,
       });
       setHeadToHeadPayload(payload);
-      setLastHeadToHeadSignature(comparisonSignature);
+      setLastHeadToHeadSignature(nextSignature);
+      return true;
     } catch (error) {
       setHeadToHeadError(error.message || 'Failed to load head-to-head');
       setHeadToHeadPayload(null);
       setLastHeadToHeadSignature('');
+      return false;
     } finally {
       setHeadToHeadLoading(false);
     }
-  }
+  }, [
+    headToHeadLimit,
+    headToHeadSnapshotFilter,
+    onStateChange,
+    teamAIds,
+    teamBIds,
+  ]);
+
+  useEffect(() => {
+    const routeKey = `A:${idsToText(routeTeamAIds)}|B:${idsToText(routeTeamBIds)}|S:${routeSnapshotId || 'latest'}`;
+    const overlap = routeTeamAIds.some((teamId) => routeTeamBIds.includes(teamId));
+
+    if (!routeTeamAIds.length || !routeTeamBIds.length || overlap) {
+      return;
+    }
+
+    if (lastAutoLoadedRouteKeyRef.current === routeKey) {
+      return;
+    }
+
+    lastAutoLoadedRouteKeyRef.current = routeKey;
+    runHeadToHead({
+      teamAIdsOverride: routeTeamAIds,
+      teamBIdsOverride: routeTeamBIds,
+      snapshotIdOverride: routeSnapshotId,
+      syncRoute: false,
+    });
+  }, [routeSnapshotId, routeTeamAIds, routeTeamBIds, runHeadToHead]);
 
   const summary = headToHeadPayload?.summary || {};
   const matches = headToHeadPayload?.matches || [];
