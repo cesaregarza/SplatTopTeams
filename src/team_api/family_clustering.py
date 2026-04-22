@@ -5,7 +5,7 @@ from typing import Callable, Dict, Sequence
 
 import numpy as np
 
-from team_api.search_logic import _eligible_for_consolidation
+from team_api.search_consolidation import _eligible_for_consolidation
 from team_api.store import EmbeddingRow
 
 

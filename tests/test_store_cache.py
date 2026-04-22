@@ -253,18 +253,19 @@ def test_analytics_team_lab_uses_family_scope_resolution():
 def test_team_lab_scope_cache_reuses_family_resolution():
     store = _store()
     cache_entry = store._build_snapshot_cache_entry(7, [_row(101)])
-    calls: List[int] = []
+    cache_entry.rows[0].team_name = "Healbook"
 
     store._get_cached_snapshot_entry = lambda snapshot_id: cache_entry  # type: ignore[assignment]
+    calls: List[str] = []
 
     def fake_search_similar_teams(**kwargs):
-        calls.append(int(kwargs["team_id"]) if "team_id" in kwargs else 101)
+        calls.append(str(kwargs["query"]))
         return {
             "results": [
                 {
-                    "team_id": 101,
+                    "team_id": int(kwargs["query"]),
                     "team_name": "Healbook",
-                    "consolidated_team_ids": [102, 103],
+                    "consolidated_team_ids": [candidate for candidate in (101, 102, 103) if candidate != int(kwargs["query"])],
                 }
             ]
         }
@@ -276,7 +277,35 @@ def test_team_lab_scope_cache_reuses_family_resolution():
 
     assert first == ([101, 102, 103], "Healbook")
     assert second == ([101, 102, 103], "Healbook")
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_team_lab_scope_uses_same_family_cluster_for_aliases():
+    store = _store()
+    cache_entry = store._build_snapshot_cache_entry(7, [_row(101), _row(102), _row(103)])
+    cache_entry.rows[0].team_name = "WE as in HealBook"
+    cache_entry.rows[0].lineup_count = 4
+    cache_entry.rows[1].team_name = "Healbook"
+    cache_entry.rows[1].lineup_count = 6
+    cache_entry.rows[2].team_name = "Healbook"
+    cache_entry.rows[2].lineup_count = 5
+
+    store._get_cached_snapshot_entry = lambda snapshot_id: cache_entry  # type: ignore[assignment]
+    store.search_similar_teams = lambda **kwargs: {  # type: ignore[assignment]
+        "results": [
+            {
+                "team_id": int(kwargs["query"]),
+                "team_name": "Healbook",
+                "consolidated_team_ids": [candidate for candidate in (101, 102, 103) if candidate != int(kwargs["query"])],
+            }
+        ]
+    }
+
+    first = store._resolve_team_lab_scope(snapshot_id=7, profile="family", team_id=101)
+    second = store._resolve_team_lab_scope(snapshot_id=7, profile="family", team_id=102)
+
+    assert first == ([101, 102, 103], "Healbook")
+    assert second == ([101, 102, 103], "Healbook")
 
 
 def test_analytics_team_lab_response_cache_avoids_repeat_work():

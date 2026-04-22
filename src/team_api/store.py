@@ -5588,6 +5588,7 @@ class TeamSearchStore:
         cache_entry = self._get_cached_snapshot_entry(snapshot_id)
         resolved = resolve_team_lab_scope(
             snapshot_rows=cache_entry.rows,
+            family_members_by_team={},
             search_similar_teams=self.search_similar_teams,
             normalize_ids=_normalize_id_sequence,
             snapshot_id=sid,
