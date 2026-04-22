@@ -262,6 +262,32 @@ function tournamentTeamMeta(team) {
   return pieces.join(' · ');
 }
 
+function tournamentTeamOptionKey(team) {
+  const id = safeIntOrNull(team?.team_id);
+  if (id && id > 0) return `team:${id}`;
+
+  const displayName = tournamentTeamDisplayName(team).toLowerCase();
+  const members = Array.isArray(team?.member_names)
+    ? team.member_names
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+      .join('|')
+    : '';
+
+  return `external:${displayName}:${members}`;
+}
+
+function teamAliasRowKey(parentTeamId, team) {
+  const id = safeIntOrNull(team?.team_id);
+  if (id && id > 0) return `alias:${parentTeamId}:${id}`;
+
+  const teamName = String(team?.team_name || '').trim().toLowerCase();
+  const matchCount = safeInt(team?.match_count);
+  const tournamentId = safeIntOrNull(team?.tournament_id) ?? 'na';
+  const eventTime = safeIntOrNull(team?.event_time_ms) ?? 'na';
+  return `alias:${parentTeamId}:${teamName}:${matchCount}:${tournamentId}:${eventTime}`;
+}
+
 export default function TeamSearch({
   selectedTeamAId = '',
   selectedTeamBId = '',
@@ -746,7 +772,7 @@ export default function TeamSearch({
                 </p>
                 {!tournamentTeamsLoading && tournamentTeams.length ? (
                   <ul className="tournament-team-dropdown" role="listbox" aria-label="Tournament teams">
-                    {tournamentTeams.slice(0, 80).map((team, index) => {
+                    {tournamentTeams.slice(0, 80).map((team) => {
                       const label = tournamentTeamDisplayName(team);
                       const optionTeamId = safeIntOrNull(team?.team_id);
                       const isSelectedTeam = selectedTournamentSeedPlayerIds.length > 0
@@ -768,7 +794,7 @@ export default function TeamSearch({
                         : baseMeta;
                       return (
                         <li
-                          key={`${team.team_id ?? 'ext'}-${label}-${index}`}
+                          key={tournamentTeamOptionKey(team)}
                           role="option"
                           aria-selected={isSelectedTeam}
                         >
@@ -1574,9 +1600,9 @@ export default function TeamSearch({
                             </tr>
                           </thead>
                           <tbody>
-                            {visibleAliases.map((team, index) => (
+                            {visibleAliases.map((team) => (
                               <tr
-                                key={`${teamIdText}-${team.team_id}-${team.team_name || 'team'}-${index}`}
+                                key={teamAliasRowKey(teamIdText, team)}
                               >
                                 <td>{safeInt(team.team_id).toLocaleString()}</td>
                                 <td>{team.team_name || `Team ${team.team_id}`}</td>
