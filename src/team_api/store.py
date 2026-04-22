@@ -5244,89 +5244,32 @@ class TeamSearchStore:
         profile: str,
         team_id: int,
     ) -> tuple[list[int], str | None]:
-        primary_team_id = int(team_id)
+        from team_api.team_lab_service import resolve_team_lab_scope
+
         cache_entry = self._get_cached_snapshot_entry(snapshot_id)
-        base_row = next(
-            (row for row in cache_entry.rows if int(row.team_id) == primary_team_id),
-            None,
+        return resolve_team_lab_scope(
+            snapshot_rows=cache_entry.rows,
+            search_similar_teams=self.search_similar_teams,
+            normalize_ids=_normalize_id_sequence,
+            snapshot_id=int(snapshot_id),
+            profile=str(profile),
+            team_id=int(team_id),
         )
-
-        if str(profile) != "family":
-            return [primary_team_id], (base_row.team_name if base_row is not None else None)
-
-        try:
-            ranked = self.search_similar_teams(
-                snapshot_id=snapshot_id,
-                query=str(primary_team_id),
-                top_n=60,
-                min_relevance=0.0,
-                cluster_mode=profile,
-                include_clusters=True,
-                consolidate=True,
-                consolidate_min_overlap=0.8,
-            )
-        except Exception:
-            ranked = {"results": []}
-
-        for result in ranked.get("results", []):
-            resolved_team_ids = _normalize_id_sequence(
-                [
-                    result.get("team_id"),
-                    *(result.get("consolidated_team_ids") or []),
-                ]
-            )
-            if primary_team_id not in resolved_team_ids:
-                continue
-            return resolved_team_ids, str(
-                result.get("team_name")
-                or (base_row.team_name if base_row is not None else f"Team {primary_team_id}")
-            )
-
-        return [primary_team_id], (base_row.team_name if base_row is not None else None)
 
     def _fetch_team_lab_match_rows(
         self,
         *,
         team_ids: Sequence[int],
     ) -> list[dict[str, Any]]:
-        scoped_team_ids = _normalize_id_sequence(team_ids)
-        if not scoped_team_ids:
-            return []
+        from team_api.team_lab_service import fetch_team_lab_match_rows
 
-        exclude_internal_alias_matches = ""
-        if len(scoped_team_ids) > 1:
-            exclude_internal_alias_matches = """
-              AND NOT (m.team1_id IN :team_ids AND m.team2_id IN :team_ids)
-            """.rstrip()
-
-        sql = f"""
-            SELECT
-                CASE
-                    WHEN m.team1_id IN :team_ids THEN m.team2_id
-                    ELSE m.team1_id
-                END AS opponent_team_id,
-                CASE
-                    WHEN m.winner_team_id IN :team_ids THEN 1
-                    ELSE 0
-                END AS is_win
-            FROM {self.schema}.matches m
-            WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
-              AND m.winner_team_id IS NOT NULL
-              {exclude_internal_alias_matches}
-        """
-        try:
-            with self.engine.connect() as conn:
-                return [
-                    dict(row)
-                    for row in conn.execute(
-                        text(sql).bindparams(bindparam("team_ids", expanding=True)),
-                        {"team_ids": scoped_team_ids},
-                    ).mappings().all()
-                ]
-        except SQLAlchemyError as exc:
-            if _is_missing_relation_error(exc):
-                return []
-            raise
+        return fetch_team_lab_match_rows(
+            engine=self.engine,
+            schema=self.schema,
+            team_ids=team_ids,
+            normalize_ids=_normalize_id_sequence,
+            is_missing_relation_error=_is_missing_relation_error,
+        )
 
     def analytics_roster_diversity(
         self,
