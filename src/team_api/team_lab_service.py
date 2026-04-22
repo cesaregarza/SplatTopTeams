@@ -102,3 +102,44 @@ def fetch_team_lab_match_rows(
         if is_missing_relation_error(exc):
             return []
         raise
+
+
+def fetch_snapshot_team_names(
+    *,
+    engine: Engine,
+    schema: str,
+    snapshot_id: int,
+    team_ids: Sequence[int],
+    normalize_ids: Callable[[Any], list[int]],
+    is_missing_relation_error: Callable[[Exception], bool],
+    is_missing_column_error: Callable[[Exception], bool],
+) -> dict[int, str]:
+    scoped_team_ids = normalize_ids(team_ids)
+    if not scoped_team_ids:
+        return {}
+
+    sql = f"""
+        SELECT team_id, team_name
+        FROM {schema}.team_search_embeddings
+        WHERE snapshot_id = :snapshot_id
+          AND team_id IN :team_ids
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(sql).bindparams(bindparam("team_ids", expanding=True)),
+                {
+                    "snapshot_id": int(snapshot_id),
+                    "team_ids": scoped_team_ids,
+                },
+            ).mappings().all()
+    except SQLAlchemyError as exc:
+        if is_missing_relation_error(exc) or is_missing_column_error(exc):
+            return {}
+        raise
+
+    return {
+        int(row["team_id"]): str(row["team_name"])
+        for row in rows
+        if row.get("team_id") is not None and row.get("team_name") is not None
+    }

@@ -69,6 +69,33 @@ def test_snapshot_cache_reuses_same_snapshot_and_evicts_previous():
     assert list(store._tournament_count_cache.keys()) == [(2, 21)]
 
 
+def test_latest_snapshot_uses_ttl_cache():
+    store = _store()
+    calls: List[int] = []
+    rows = [
+        {"run_id": 7, "teams_indexed": 100},
+        {"run_id": 8, "teams_indexed": 125},
+    ]
+    times = iter([100.0, 105.0, 121.0])
+
+    store._monotonic_now = lambda: next(times)  # type: ignore[assignment]
+
+    def fake_fetch_first_row(sql, params):
+        calls.append(1)
+        return dict(rows[len(calls) - 1])
+
+    store._fetch_first_row = fake_fetch_first_row  # type: ignore[assignment]
+
+    first = store.latest_snapshot()
+    second = store.latest_snapshot()
+    third = store.latest_snapshot()
+
+    assert first == {"run_id": 7, "teams_indexed": 100}
+    assert second == {"run_id": 7, "teams_indexed": 100}
+    assert third == {"run_id": 8, "teams_indexed": 125}
+    assert len(calls) == 2
+
+
 def test_row_to_embedding_parses_lineup_variant_counts():
     store = _store()
 
@@ -221,6 +248,115 @@ def test_analytics_team_lab_uses_family_scope_resolution():
     assert result["team"]["lineup_count"] == 10
     assert result["match_summary"]["matches"] == 2
     assert result["neighbors"][0]["team_id"] == 202
+
+
+def test_team_lab_scope_cache_reuses_family_resolution():
+    store = _store()
+    cache_entry = store._build_snapshot_cache_entry(7, [_row(101)])
+    calls: List[int] = []
+
+    store._get_cached_snapshot_entry = lambda snapshot_id: cache_entry  # type: ignore[assignment]
+
+    def fake_search_similar_teams(**kwargs):
+        calls.append(int(kwargs["team_id"]) if "team_id" in kwargs else 101)
+        return {
+            "results": [
+                {
+                    "team_id": 101,
+                    "team_name": "Healbook",
+                    "consolidated_team_ids": [102, 103],
+                }
+            ]
+        }
+
+    store.search_similar_teams = fake_search_similar_teams  # type: ignore[assignment]
+
+    first = store._resolve_team_lab_scope(snapshot_id=7, profile="family", team_id=101)
+    second = store._resolve_team_lab_scope(snapshot_id=7, profile="family", team_id=101)
+
+    assert first == ([101, 102, 103], "Healbook")
+    assert second == ([101, 102, 103], "Healbook")
+    assert len(calls) == 1
+
+
+def test_analytics_team_lab_response_cache_avoids_repeat_work():
+    store = _store()
+    family_a = _row(101, lineup_count=6, roster_player_ids=(1, 2, 3, 4))
+    family_b = _row(102, lineup_count=4, roster_player_ids=(1, 2, 3, 5))
+    outsider = _row(202, lineup_count=8, roster_player_ids=(7, 8, 9, 10))
+    cache_entry = store._build_snapshot_cache_entry(7, [family_a, family_b, outsider])
+
+    scope_calls: List[tuple[int, str, int]] = []
+    match_calls: List[tuple[int, ...]] = []
+
+    store._get_cached_snapshot_entry = lambda snapshot_id: cache_entry  # type: ignore[assignment]
+    store._get_cached_cluster_map = lambda snapshot_id, profile: {}  # type: ignore[assignment]
+
+    def fake_scope(snapshot_id, profile, team_id):
+        scope_calls.append((int(snapshot_id), str(profile), int(team_id)))
+        return [101, 102], "Healbook"
+
+    def fake_match_rows(team_ids):
+        match_calls.append(tuple(int(team_id) for team_id in team_ids))
+        return [
+            {"opponent_team_id": 202, "is_win": 1},
+            {"opponent_team_id": 202, "is_win": 0},
+        ]
+
+    store._resolve_team_lab_scope = fake_scope  # type: ignore[assignment]
+    store._fetch_team_lab_match_rows = fake_match_rows  # type: ignore[assignment]
+
+    first = store.analytics_team_lab(snapshot_id=7, profile="family", team_id=101, neighbors=5)
+    second = store.analytics_team_lab(snapshot_id=7, profile="family", team_id=101, neighbors=5)
+
+    assert first == second
+    assert len(scope_calls) == 1
+    assert len(match_calls) == 1
+
+
+def test_analytics_team_matches_response_cache_avoids_repeat_queries():
+    store = _store()
+    base_calls: List[tuple[int, ...]] = []
+    roster_calls: List[int] = []
+    round_calls: List[int] = []
+    score_calls: List[int] = []
+    name_calls: List[tuple[int, ...]] = []
+
+    store._fetch_team_match_base_rows = lambda team_ids, limit: base_calls.append(tuple(int(team_id) for team_id in team_ids)) or [  # type: ignore[assignment]
+        {
+            "match_id": 77,
+            "team1_id": 101,
+            "team2_id": 202,
+            "tournament_id": 19,
+            "winner_team_id": 101,
+            "team_score": 3.0,
+            "opponent_score": 1.0,
+            "tournament_name": "LUTI",
+            "tournament_mode": None,
+            "map_picking_style": None,
+            "tournament_tags": None,
+            "event_time_ms": 1_700_000_000_000,
+        }
+    ]
+    store._fetch_match_rosters = lambda rows, team_ids, opponent_ids: roster_calls.append(len(rows)) or {  # type: ignore[assignment]
+        (77, 19): {
+            "team_a": {"player_ids": [1, 2, 3, 4], "player_names": ["A", "B", "C", "D"]},
+            "team_b": {"player_ids": [5, 6, 7, 8], "player_names": ["E", "F", "G", "H"]},
+        }
+    }
+    store._fetch_match_rounds = lambda rows, team_ids, opponent_ids: round_calls.append(len(rows)) or {}  # type: ignore[assignment]
+    store._fetch_tournament_scores = lambda tournament_ids: score_calls.append(len(tournament_ids)) or {19: 8.0}  # type: ignore[assignment]
+    store._get_cached_snapshot_team_names = lambda snapshot_id, team_ids: name_calls.append(tuple(int(team_id) for team_id in team_ids)) or {101: "Alpha", 202: "Bravo"}  # type: ignore[assignment]
+
+    first = store.analytics_team_matches(snapshot_id=7, team_ids=[101], limit=25)
+    second = store.analytics_team_matches(snapshot_id=7, team_ids=[101], limit=25)
+
+    assert first == second
+    assert base_calls == [(101,)]
+    assert roster_calls == [1]
+    assert round_calls == [1]
+    assert score_calls == [1]
+    assert name_calls == [(101, 202)]
 
 
 def test_list_tournament_teams_falls_back_to_sendou_when_snapshot_missing():

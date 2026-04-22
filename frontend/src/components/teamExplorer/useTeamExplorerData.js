@@ -40,6 +40,7 @@ const INITIAL_HISTORY_UI = {
   expandedEventKeys: [],
   page: 1,
 };
+const EMPTY_ROWS = [];
 
 export function useTeamExplorerData({
   selectedTeamId,
@@ -204,8 +205,8 @@ export function useTeamExplorerData({
       });
   }, [detailState.teamProfile, rosterOrderByPlayer, rosterPresenceByPlayer]);
 
-  const neighborsRows = detailState.teamLab?.neighbors || [];
-  const matches = detailState.matchHistory?.matches || [];
+  const neighborsRows = detailState.teamLab?.neighbors ?? EMPTY_ROWS;
+  const matches = detailState.matchHistory?.matches ?? EMPTY_ROWS;
   const fallbackSummary = useMemo(() => {
     const primaryTeamId = Number(detailState.teamProfile?.team_id ?? detailState.teamLab?.team?.team_id);
     const primaryTeamName = String(detailState.teamProfile?.team_name || detailState.teamLab?.team?.team_name || '').trim();
@@ -349,13 +350,20 @@ export function useTeamExplorerData({
       const availableKeys = new Set(visibleMatchEvents.map((event) => event.key));
       const retainedKeys = previousUi.expandedEventKeys.filter((key) => availableKeys.has(key));
       if (retainedKeys.length) {
-        return previousUi.expandedEventKeys === retainedKeys
+        const isUnchanged = retainedKeys.length === previousUi.expandedEventKeys.length
+          && retainedKeys.every((key, index) => key === previousUi.expandedEventKeys[index]);
+        return isUnchanged
           ? previousUi
           : { ...previousUi, expandedEventKeys: retainedKeys };
       }
+      if (!visibleMatchEvents.length) {
+        return previousUi.expandedEventKeys.length
+          ? { ...previousUi, expandedEventKeys: [] }
+          : previousUi;
+      }
       return {
         ...previousUi,
-        expandedEventKeys: visibleMatchEvents.length ? [visibleMatchEvents[0].key] : [],
+        expandedEventKeys: [visibleMatchEvents[0].key],
       };
     });
   }, [visibleMatchEvents]);

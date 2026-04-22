@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from itertools import combinations
 import json
@@ -363,6 +364,12 @@ class EmbeddingSnapshotCacheEntry:
     built_at_ms: int
 
 
+@dataclass
+class _TTLCacheEntry:
+    value: Any
+    expires_at: float
+
+
 class TeamSearchStore:
     _MATCH_SCORE_CANDIDATES = (
         ("team1_score", "team2_score"),
@@ -372,6 +379,9 @@ class TeamSearchStore:
         ("team1_points", "team2_points"),
         ("team1_goals", "team2_goals"),
     )
+    _LATEST_SNAPSHOT_TTL_SECONDS = 10.0
+    _READ_RESPONSE_TTL_SECONDS = 30.0
+    _SUGGEST_RESPONSE_TTL_SECONDS = 15.0
 
     def __init__(self, engine: Engine, schema: str):
         self.engine = engine
@@ -384,11 +394,131 @@ class TeamSearchStore:
         self._player_rankings_rank_column: Optional[str] = None
         self._player_rankings_rank_column_checked: bool = False
         self._cache_lock = threading.RLock()
+        self._latest_snapshot_cache: Optional[_TTLCacheEntry] = None
         self._embedding_snapshot_cache: Optional[EmbeddingSnapshotCacheEntry] = None
+        self._snapshot_config_cache: Dict[int, Dict[str, Any]] = {}
         self._cluster_map_cache: Dict[tuple[int, str], Dict[int, Dict[str, Any]]] = {}
         self._tournament_count_cache: Dict[tuple[int, int], int] = {}
         self._sendou_tournament_team_cache: Dict[int, List[Dict[str, Any]]] = {}
+        self._team_lab_scope_cache: Dict[tuple[int, str, int], tuple[list[int], str | None]] = {}
+        self._snapshot_team_name_cache: Dict[int, Dict[int, str]] = {}
+        self._team_lab_response_cache: Dict[tuple[int, str, int, int], _TTLCacheEntry] = {}
+        self._team_matches_response_cache: Dict[tuple[int, tuple[int, ...], int], _TTLCacheEntry] = {}
+        self._cluster_list_response_cache: Dict[tuple[int, str, str, int], _TTLCacheEntry] = {}
+        self._cluster_detail_response_cache: Dict[tuple[int, str, int], _TTLCacheEntry] = {}
+        self._team_name_suggest_response_cache: Dict[tuple[int, str, int], _TTLCacheEntry] = {}
         self._has_trgm: Optional[bool] = None
+
+    @staticmethod
+    def _monotonic_now() -> float:
+        return time.monotonic()
+
+    def _get_ttl_cached_value(
+        self,
+        cache: Dict[Any, _TTLCacheEntry],
+        key: Any,
+        *,
+        cache_name: str,
+    ) -> Any:
+        now = self._monotonic_now()
+        with self._cache_lock:
+            entry = cache.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= now:
+                cache.pop(key, None)
+                logger.debug("%s_cache_expired schema=%s key=%r", cache_name, self.schema, key)
+                return None
+            logger.debug("%s_cache_hit schema=%s key=%r", cache_name, self.schema, key)
+            return copy.deepcopy(entry.value)
+
+    def _set_ttl_cached_value(
+        self,
+        cache: Dict[Any, _TTLCacheEntry],
+        key: Any,
+        value: Any,
+        *,
+        ttl_seconds: float,
+    ) -> None:
+        expires_at = self._monotonic_now() + max(float(ttl_seconds), 0.0)
+        with self._cache_lock:
+            cache[key] = _TTLCacheEntry(value=value, expires_at=expires_at)
+
+    def _prune_snapshot_scoped_caches_locked(
+        self,
+        active_snapshot_id: Optional[int] = None,
+    ) -> None:
+        if active_snapshot_id is None:
+            self._embedding_snapshot_cache = None
+            self._snapshot_config_cache.clear()
+            self._cluster_map_cache.clear()
+            self._tournament_count_cache.clear()
+            self._team_lab_scope_cache.clear()
+            self._snapshot_team_name_cache.clear()
+            self._team_lab_response_cache.clear()
+            self._team_matches_response_cache.clear()
+            self._cluster_list_response_cache.clear()
+            self._cluster_detail_response_cache.clear()
+            self._team_name_suggest_response_cache.clear()
+            return
+
+        sid = int(active_snapshot_id)
+        if (
+            self._embedding_snapshot_cache is not None
+            and int(self._embedding_snapshot_cache.snapshot_id) != sid
+        ):
+            self._embedding_snapshot_cache = None
+
+        self._snapshot_config_cache = {
+            snapshot_id: value
+            for snapshot_id, value in self._snapshot_config_cache.items()
+            if int(snapshot_id) == sid
+        }
+        self._cluster_map_cache = {
+            key: value
+            for key, value in self._cluster_map_cache.items()
+            if int(key[0]) == sid
+        }
+        self._tournament_count_cache = {
+            key: value
+            for key, value in self._tournament_count_cache.items()
+            if int(key[0]) == sid
+        }
+        self._team_lab_scope_cache = {
+            key: value
+            for key, value in self._team_lab_scope_cache.items()
+            if int(key[0]) == sid
+        }
+        self._snapshot_team_name_cache = {
+            snapshot_id: value
+            for snapshot_id, value in self._snapshot_team_name_cache.items()
+            if int(snapshot_id) == sid
+        }
+        self._team_lab_response_cache = {
+            key: value
+            for key, value in self._team_lab_response_cache.items()
+            if int(key[0]) == sid
+        }
+        self._team_matches_response_cache = {
+            key: value
+            for key, value in self._team_matches_response_cache.items()
+            if int(key[0]) == sid
+        }
+        self._cluster_list_response_cache = {
+            key: value
+            for key, value in self._cluster_list_response_cache.items()
+            if int(key[0]) == sid
+        }
+        self._cluster_detail_response_cache = {
+            key: value
+            for key, value in self._cluster_detail_response_cache.items()
+            if int(key[0]) == sid
+        }
+        self._team_name_suggest_response_cache = {
+            key: value
+            for key, value in self._team_name_suggest_response_cache.items()
+            if int(key[0]) == sid
+        }
 
     def _detect_trgm_support(self) -> bool:
         if self._has_trgm is not None:
@@ -2378,6 +2508,11 @@ class TeamSearchStore:
         )
 
         start_total = time.perf_counter()
+        match_targets_ms = 0.0
+        cluster_map_ms = 0.0
+        query_rows_ms = 0.0
+        rank_ms = 0.0
+        consolidate_ms = 0.0
         query_tournament_id = (
             int(tournament_id) if tournament_id is not None else None
         )
@@ -2394,19 +2529,25 @@ class TeamSearchStore:
         query_team_weights: Optional[Dict[int, float]] = None
         seed_query_metadata: Dict[str, int] = {}
         direct_query_profile: Optional[Dict[str, object]] = None
+        phase_start = time.perf_counter()
         target_ids = self.match_targets(
             snapshot_id=snapshot_id,
             query=query,
             limit=max(1, min(int(top_n), 60)),
             tournament_id=query_tournament_id,
         )
+        match_targets_ms = (time.perf_counter() - phase_start) * 1000.0
+        phase_start = time.perf_counter()
         cluster_map = (
             self._get_cached_cluster_map(snapshot_id, cluster_mode)
             if include_clusters
             else {}
         )
+        cluster_map_ms = (time.perf_counter() - phase_start) * 1000.0
 
+        phase_start = time.perf_counter()
         query_rows = self._fetch_embeddings_by_team_ids(snapshot_id, target_ids)
+        query_rows_ms = (time.perf_counter() - phase_start) * 1000.0
         if not query_rows and (
             query_tournament_id is not None or explicit_seed_player_ids
         ):
@@ -2544,6 +2685,17 @@ class TeamSearchStore:
                 query,
                 (time.perf_counter() - start_total) * 1000.0,
             )
+            logger.debug(
+                "team_search_phases schema=%s snapshot_id=%s query=%r match_targets_ms=%.1f cluster_map_ms=%.1f query_rows_ms=%.1f rank_ms=%.1f consolidate_ms=%.1f",
+                self.schema,
+                int(snapshot_id),
+                query,
+                match_targets_ms,
+                cluster_map_ms,
+                query_rows_ms,
+                rank_ms,
+                consolidate_ms,
+            )
             return {
                 "query": query_context,
                 "results": [],
@@ -2556,6 +2708,7 @@ class TeamSearchStore:
             else top_n
         )
 
+        phase_start = time.perf_counter()
         ranked = self._query_vector_rank(
             snapshot_id=snapshot_id,
             query_rows=query_rows or None,
@@ -2573,6 +2726,7 @@ class TeamSearchStore:
             rerank_weight_pair=rerank_weight_pair,
             use_pair_rerank=use_pair_rerank,
         )
+        rank_ms = (time.perf_counter() - phase_start) * 1000.0
 
         if ranked is not None:
             # Adaptive relevance for ANN path.
@@ -2580,6 +2734,7 @@ class TeamSearchStore:
                 len(ranked.get("results", [])) < 3
                 and min_relevance > 0.5
             ):
+                phase_start = time.perf_counter()
                 relaxed = self._query_vector_rank(
                     snapshot_id=snapshot_id,
                     query_rows=query_rows or None,
@@ -2602,8 +2757,10 @@ class TeamSearchStore:
                 ) > len(ranked.get("results", [])):
                     ranked = relaxed
                     ranked.setdefault("query", {})["relevance_relaxed"] = True
+                rank_ms += (time.perf_counter() - phase_start) * 1000.0
 
             if consolidate:
+                phase_start = time.perf_counter()
                 ranked["results"] = consolidate_ranked_results(
                     ranked["results"],
                     min_overlap=consolidate_min_overlap,
@@ -2618,6 +2775,7 @@ class TeamSearchStore:
                         use_pair_rerank=use_pair_rerank,
                         recency_weight=recency_weight,
                     )
+                consolidate_ms = (time.perf_counter() - phase_start) * 1000.0
             ranked = self._finalize_ranked_results(ranked, top_n=top_n)
             if query_tournament_id is not None:
                 ranked_query = ranked.setdefault("query", {})
@@ -2644,10 +2802,22 @@ class TeamSearchStore:
                 len(ranked.get("results", [])),
                 (time.perf_counter() - start_total) * 1000.0,
             )
+            logger.debug(
+                "team_search_phases schema=%s snapshot_id=%s query=%r match_targets_ms=%.1f cluster_map_ms=%.1f query_rows_ms=%.1f rank_ms=%.1f consolidate_ms=%.1f",
+                self.schema,
+                int(snapshot_id),
+                query,
+                match_targets_ms,
+                cluster_map_ms,
+                query_rows_ms,
+                rank_ms,
+                consolidate_ms,
+            )
             return ranked
 
         cache_entry = cache_entry or self._get_cached_snapshot_entry(snapshot_id)
         all_rows = cache_entry.rows
+        phase_start = time.perf_counter()
         ranked = self._rank_similar_teams(
             embeddings=all_rows,
             target_team_ids=target_ids,
@@ -2665,12 +2835,14 @@ class TeamSearchStore:
             rerank_weight_pair=rerank_weight_pair,
             use_pair_rerank=use_pair_rerank,
         )
+        rank_ms = (time.perf_counter() - phase_start) * 1000.0
         # Adaptive relevance: retry with a relaxed threshold when results
         # are very sparse so the user doesn't see a confusing empty page.
         if (
             len(ranked.get("results", [])) < 3
             and min_relevance > 0.5
         ):
+            phase_start = time.perf_counter()
             relaxed = self._rank_similar_teams(
                 embeddings=all_rows,
                 target_team_ids=target_ids,
@@ -2693,8 +2865,10 @@ class TeamSearchStore:
             ):
                 ranked = relaxed
                 ranked.setdefault("query", {})["relevance_relaxed"] = True
+            rank_ms += (time.perf_counter() - phase_start) * 1000.0
 
         if consolidate:
+            phase_start = time.perf_counter()
             ranked["results"] = consolidate_ranked_results(
                 ranked["results"],
                 min_overlap=consolidate_min_overlap,
@@ -2709,6 +2883,7 @@ class TeamSearchStore:
                     use_pair_rerank=use_pair_rerank,
                     recency_weight=recency_weight,
                 )
+            consolidate_ms = (time.perf_counter() - phase_start) * 1000.0
         ranked = self._finalize_ranked_results(ranked, top_n=top_n)
         if query_tournament_id is not None:
             ranked_query = ranked.setdefault("query", {})
@@ -2734,6 +2909,17 @@ class TeamSearchStore:
             len(target_ids),
             len(ranked.get("results", [])),
             (time.perf_counter() - start_total) * 1000.0,
+        )
+        logger.debug(
+            "team_search_phases schema=%s snapshot_id=%s query=%r match_targets_ms=%.1f cluster_map_ms=%.1f query_rows_ms=%.1f rank_ms=%.1f consolidate_ms=%.1f",
+            self.schema,
+            int(snapshot_id),
+            query,
+            match_targets_ms,
+            cluster_map_ms,
+            query_rows_ms,
+            rank_ms,
+            consolidate_ms,
         )
         return ranked
 
@@ -2769,6 +2955,13 @@ class TeamSearchStore:
         return True
 
     def latest_snapshot(self) -> Optional[Dict[str, Any]]:
+        now = self._monotonic_now()
+        with self._cache_lock:
+            cached = self._latest_snapshot_cache
+            if cached is not None and cached.expires_at > now:
+                logger.debug("latest_snapshot_cache_hit schema=%s", self.schema)
+                return dict(cached.value) if isinstance(cached.value, dict) else None
+
         sql = f"""
             SELECT run_id, finished_at, teams_indexed
             FROM {self.schema}.team_search_refresh_runs
@@ -2777,7 +2970,27 @@ class TeamSearchStore:
             LIMIT 1
         """
         row = self._fetch_first_row(sql, {})
-        return row
+        with self._cache_lock:
+            previous_run_id = None
+            previous_cache = self._latest_snapshot_cache
+            if previous_cache is not None and isinstance(previous_cache.value, dict):
+                previous_run_id = previous_cache.value.get("run_id")
+            self._latest_snapshot_cache = _TTLCacheEntry(
+                value=dict(row) if row else None,
+                expires_at=now + self._LATEST_SNAPSHOT_TTL_SECONDS,
+            )
+            current_run_id = row.get("run_id") if row else None
+            if current_run_id != previous_run_id:
+                self._prune_snapshot_scoped_caches_locked(
+                    int(current_run_id) if current_run_id is not None else None
+                )
+        logger.debug(
+            "latest_snapshot_cache_miss schema=%s found=%s run_id=%s",
+            self.schema,
+            bool(row),
+            row.get("run_id") if row else None,
+        )
+        return dict(row) if row else None
 
     def list_completed_snapshots(self, limit: int = 10) -> List[Dict[str, Any]]:
         sql = f"""
@@ -2802,6 +3015,12 @@ class TeamSearchStore:
         return [dict(row) for row in rows]
 
     def _fetch_snapshot_embedding_config(self, snapshot_id: int) -> Dict[str, Any]:
+        sid = int(snapshot_id)
+        with self._cache_lock:
+            cached = self._snapshot_config_cache.get(sid)
+            if cached is not None:
+                return dict(cached)
+
         sql_with_cap = f"""
             SELECT
                 semantic_dim,
@@ -2825,7 +3044,7 @@ class TeamSearchStore:
             try:
                 row = conn.execute(
                     text(sql_with_cap),
-                    {"snapshot_id": int(snapshot_id)},
+                    {"snapshot_id": sid},
                 ).mappings().first()
             except SQLAlchemyError as exc:
                 if _is_missing_relation_error(exc):
@@ -2835,7 +3054,7 @@ class TeamSearchStore:
                 try:
                     row = conn.execute(
                         text(sql_without_cap),
-                        {"snapshot_id": int(snapshot_id)},
+                        {"snapshot_id": sid},
                     ).mappings().first()
                 except SQLAlchemyError as fallback_exc:
                     if _is_missing_relation_error(fallback_exc):
@@ -2847,6 +3066,8 @@ class TeamSearchStore:
 
         payload = dict(row)
         payload.setdefault("identity_idf_cap", 3.0)
+        with self._cache_lock:
+            self._snapshot_config_cache[sid] = dict(payload)
         return payload
 
     def _row_to_embedding(self, row: Dict[str, Any]) -> EmbeddingRow:
@@ -3218,9 +3439,8 @@ class TeamSearchStore:
     def _invalidate_snapshot_cache(self, snapshot_id: Optional[int] = None) -> None:
         with self._cache_lock:
             if snapshot_id is None:
-                self._embedding_snapshot_cache = None
-                self._cluster_map_cache.clear()
-                self._tournament_count_cache.clear()
+                self._latest_snapshot_cache = None
+                self._prune_snapshot_scoped_caches_locked(None)
                 return
 
             sid = int(snapshot_id)
@@ -3229,7 +3449,7 @@ class TeamSearchStore:
                 and int(self._embedding_snapshot_cache.snapshot_id) == sid
             ):
                 self._embedding_snapshot_cache = None
-
+            self._snapshot_config_cache.pop(sid, None)
             self._cluster_map_cache = {
                 key: value
                 for key, value in self._cluster_map_cache.items()
@@ -3238,6 +3458,37 @@ class TeamSearchStore:
             self._tournament_count_cache = {
                 key: value
                 for key, value in self._tournament_count_cache.items()
+                if int(key[0]) != sid
+            }
+            self._team_lab_scope_cache = {
+                key: value
+                for key, value in self._team_lab_scope_cache.items()
+                if int(key[0]) != sid
+            }
+            self._snapshot_team_name_cache.pop(sid, None)
+            self._team_lab_response_cache = {
+                key: value
+                for key, value in self._team_lab_response_cache.items()
+                if int(key[0]) != sid
+            }
+            self._team_matches_response_cache = {
+                key: value
+                for key, value in self._team_matches_response_cache.items()
+                if int(key[0]) != sid
+            }
+            self._cluster_list_response_cache = {
+                key: value
+                for key, value in self._cluster_list_response_cache.items()
+                if int(key[0]) != sid
+            }
+            self._cluster_detail_response_cache = {
+                key: value
+                for key, value in self._cluster_detail_response_cache.items()
+                if int(key[0]) != sid
+            }
+            self._team_name_suggest_response_cache = {
+                key: value
+                for key, value in self._team_name_suggest_response_cache.items()
                 if int(key[0]) != sid
             }
 
@@ -3260,17 +3511,8 @@ class TeamSearchStore:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         with self._cache_lock:
             self._embedding_snapshot_cache = built
-            # Keep auxiliary caches bounded to the active snapshot.
-            self._cluster_map_cache = {
-                key: value
-                for key, value in self._cluster_map_cache.items()
-                if int(key[0]) == sid
-            }
-            self._tournament_count_cache = {
-                key: value
-                for key, value in self._tournament_count_cache.items()
-                if int(key[0]) == sid
-            }
+            self._prune_snapshot_scoped_caches_locked(sid)
+            self._embedding_snapshot_cache = built
         logger.debug(
             "snapshot_cache_miss schema=%s snapshot_id=%s teams=%s build_ms=%.1f",
             self.schema,
@@ -3746,6 +3988,14 @@ class TeamSearchStore:
         if not q:
             return []
         limit = max(1, min(limit, 25))
+        cache_key = (int(snapshot_id), q, int(limit))
+        cached = self._get_ttl_cached_value(
+            self._team_name_suggest_response_cache,
+            cache_key,
+            cache_name="team_name_suggest_response",
+        )
+        if cached is not None:
+            return cached
 
         prefix_sql = f"""
             SELECT DISTINCT ON (LOWER(team_name))
@@ -3818,7 +4068,14 @@ class TeamSearchStore:
             except SQLAlchemyError:
                 pass
 
-        return suggestions[:limit]
+        out = suggestions[:limit]
+        self._set_ttl_cached_value(
+            self._team_name_suggest_response_cache,
+            cache_key,
+            out,
+            ttl_seconds=self._SUGGEST_RESPONSE_TTL_SECONDS,
+        )
+        return out
 
     def match_targets(
         self,
@@ -4007,17 +4264,29 @@ class TeamSearchStore:
     def list_clusters(
         self, snapshot_id: int, profile: str, query: Optional[str], limit: int
     ) -> List[Dict[str, Any]]:
+        sid = int(snapshot_id)
+        normalized_query = str(query or "").strip().lower()
+        normalized_limit = max(1, min(int(limit), 200))
+        cache_key = (sid, str(profile), normalized_query, normalized_limit)
+        cached = self._get_ttl_cached_value(
+            self._cluster_list_response_cache,
+            cache_key,
+            cache_name="cluster_list_response",
+        )
+        if cached is not None:
+            return cached
+
         params: Dict[str, Any] = {
-            "snapshot_id": int(snapshot_id),
+            "snapshot_id": sid,
             "profile": profile,
         }
         where_extra = ""
-        if query:
+        if normalized_query:
             where_extra = (
                 "AND (LOWER(COALESCE(c.representative_team_name, '')) LIKE :name_like "
                 "OR LOWER(COALESCE(e.team_name, '')) LIKE :name_like)"
             )
-            params["name_like"] = f"%{query.lower()}%"
+            params["name_like"] = f"%{normalized_query}%"
 
         sql = f"""
             SELECT
@@ -4083,7 +4352,14 @@ class TeamSearchStore:
                 "stable" if size >= 8 else "rotational" if size >= 4 else "small"
             )
 
-        return clusters[: max(1, min(limit, 200))]
+        out = clusters[:normalized_limit]
+        self._set_ttl_cached_value(
+            self._cluster_list_response_cache,
+            cache_key,
+            out,
+            ttl_seconds=self._READ_RESPONSE_TTL_SECONDS,
+        )
+        return out
 
     def cluster_detail(
         self,
@@ -4091,6 +4367,17 @@ class TeamSearchStore:
         profile: str,
         cluster_id: int,
     ) -> Optional[Dict[str, Any]]:
+        sid = int(snapshot_id)
+        cid = int(cluster_id)
+        cache_key = (sid, str(profile), cid)
+        cached = self._get_ttl_cached_value(
+            self._cluster_detail_response_cache,
+            cache_key,
+            cache_name="cluster_detail_response",
+        )
+        if cached is not None:
+            return cached
+
         sql = f"""
             SELECT
                 c.cluster_id,
@@ -4116,7 +4403,7 @@ class TeamSearchStore:
             {
                 "snapshot_id": int(snapshot_id),
                 "profile": profile,
-                "cluster_id": int(cluster_id),
+                "cluster_id": cid,
             },
             missing_default=[],
         )
@@ -4146,12 +4433,19 @@ class TeamSearchStore:
                 }
             )
 
-        return {
+        out = {
             "cluster_id": int(header["cluster_id"]),
             "cluster_size": int(header["cluster_size"]),
             "representative_team_name": header["representative_team_name"],
             "members": members,
         }
+        self._set_ttl_cached_value(
+            self._cluster_detail_response_cache,
+            cache_key,
+            out,
+            ttl_seconds=self._READ_RESPONSE_TTL_SECONDS,
+        )
+        return out
 
     def get_refresh_run(self, snapshot_id: int) -> Optional[Dict[str, Any]]:
         sql = f"""
@@ -4566,33 +4860,14 @@ class TeamSearchStore:
                 if row.get("tournament_id") is not None
             ]
         )
-        team_name_rows = []
-        if snapshot_id is not None:
-            try:
-                with self.engine.connect() as conn:
-                    team_name_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT team_id, team_name
-                              FROM {self.schema}.team_search_embeddings
-                             WHERE snapshot_id = :snapshot_id
-                               AND team_id IN :team_ids
-                            """
-                        ).bindparams(bindparam("team_ids", expanding=True)),
-                        {
-                            "snapshot_id": int(snapshot_id),
-                            "team_ids": team_a_ids_sorted + team_b_ids_sorted,
-                        },
-                    ).mappings().all()
-            except SQLAlchemyError as exc:
-                if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
-                    raise
-
-        team_names = {
-            int(row["team_id"]): str(row["team_name"])
-            for row in team_name_rows
-            if row is not None and row.get("team_id") is not None
-        }
+        team_names = (
+            self._get_cached_snapshot_team_names(
+                int(snapshot_id),
+                team_a_ids_sorted + team_b_ids_sorted,
+            )
+            if snapshot_id is not None
+            else {}
+        )
 
         summary = {
             "team_a_id": team_a_ids_sorted[0],
@@ -4791,59 +5066,65 @@ class TeamSearchStore:
             "matches": matchups,
         }
 
-    def analytics_team_matches(
-        self,
-        *,
+    @staticmethod
+    def _empty_team_matches_payload(
         snapshot_id: int,
         team_ids: Sequence[int],
-        limit: int,
     ) -> Dict[str, Any]:
+        normalized_team_ids = _normalize_id_sequence(team_ids)
+        primary_team_id = normalized_team_ids[0] if normalized_team_ids else None
+        return {
+            "snapshot_id": int(snapshot_id),
+            "summary": {
+                "primary_team_id": primary_team_id,
+                "primary_team_name": None,
+                "team_ids": normalized_team_ids,
+                "team_names": [],
+                "selected_team_count": len(normalized_team_ids),
+                "total_matches": 0,
+                "wins": 0,
+                "losses": 0,
+                "unresolved_matches": 0,
+                "decided_matches": 0,
+                "win_rate": 0.0,
+                "tournaments": 0,
+                "tournament_tier_distribution": {
+                    "X": 0,
+                    "S+": 0,
+                    "S": 0,
+                    "A+": 0,
+                    "A": 0,
+                    "A-": 0,
+                    "Unscored": 0,
+                },
+                "tournament_tier_match_distribution": {
+                    "X": 0,
+                    "S+": 0,
+                    "S": 0,
+                    "A+": 0,
+                    "A": 0,
+                    "A-": 0,
+                    "Unscored": 0,
+                },
+            },
+            "matches": [],
+        }
+
+    def _fetch_team_match_base_rows(
+        self,
+        *,
+        team_ids: Sequence[int],
+        limit: int,
+    ) -> list[Dict[str, object]]:
         team_ids_sorted = _normalize_id_sequence(team_ids)
         if not team_ids_sorted:
-            return {
-                "snapshot_id": snapshot_id,
-                "summary": {
-                    "primary_team_id": None,
-                    "primary_team_name": None,
-                    "team_ids": [],
-                    "team_names": [],
-                    "selected_team_count": 0,
-                    "total_matches": 0,
-                    "wins": 0,
-                    "losses": 0,
-                    "unresolved_matches": 0,
-                    "decided_matches": 0,
-                    "win_rate": 0.0,
-                    "tournaments": 0,
-                    "tournament_tier_distribution": {
-                        "X": 0,
-                        "S+": 0,
-                        "S": 0,
-                        "A+": 0,
-                        "A": 0,
-                        "A-": 0,
-                        "Unscored": 0,
-                    },
-                    "tournament_tier_match_distribution": {
-                        "X": 0,
-                        "S+": 0,
-                        "S": 0,
-                        "A+": 0,
-                        "A": 0,
-                        "A-": 0,
-                        "Unscored": 0,
-                    },
-                },
-                "matches": [],
-            }
+            return []
 
-        primary_team_id = int(team_ids_sorted[0])
         match_last_game = self._seconds_expr("m.last_game_finished_at_ms")
         match_created = self._seconds_expr("m.created_at_ms")
         tournament_start = self._seconds_expr("t.start_time_ms")
         event_time_expr = f"COALESCE({match_last_game}, {match_created}, {tournament_start})"
         event_time_expr_without_tournament = f"COALESCE({match_last_game}, {match_created})"
-
         params: Dict[str, object] = {
             "team_ids": team_ids_sorted,
             "limit": max(1, int(limit)),
@@ -4878,6 +5159,121 @@ class TeamSearchStore:
                   AND NOT (m.team1_id IN :team_ids AND m.team2_id IN :team_ids)
             """.rstrip()
 
+        sql_with_tournament_name = f"""
+            SELECT
+                m.match_id,
+                m.tournament_id,
+                t.tournament_name,
+                m.team1_id,
+                m.team2_id,
+                {winner_score_select}
+                ,
+                NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                t.tags AS tournament_tags,
+                {event_time_expr} AS event_time_ms
+            FROM {self.schema}.matches m
+            LEFT JOIN {self.schema}.tournaments t
+              ON t.tournament_id = m.tournament_id
+            WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+              {exclude_internal_alias_matches}
+            ORDER BY {event_time_expr} DESC NULLS LAST
+            LIMIT :limit
+        """
+
+        sql_with_tournament_name_column = f"""
+            SELECT
+                m.match_id,
+                m.tournament_id,
+                t.name AS tournament_name,
+                m.team1_id,
+                m.team2_id,
+                {winner_score_select}
+                ,
+                NULLIF(btrim(t.format_hint), '') AS tournament_mode,
+                NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
+                t.tags AS tournament_tags,
+                {event_time_expr} AS event_time_ms
+            FROM {self.schema}.matches m
+            LEFT JOIN {self.schema}.tournaments t
+              ON t.tournament_id = m.tournament_id
+            WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+              {exclude_internal_alias_matches}
+            ORDER BY {event_time_expr} DESC NULLS LAST
+            LIMIT :limit
+        """
+
+        sql_without_tournament = f"""
+            SELECT
+                m.match_id,
+                m.tournament_id,
+                NULL::text AS tournament_name,
+                m.team1_id,
+                m.team2_id,
+                {winner_score_select}
+                ,
+                NULL::text AS tournament_mode,
+                NULL::text AS map_picking_style,
+                NULL::jsonb AS tournament_tags,
+                {event_time_expr_without_tournament} AS event_time_ms
+            FROM {self.schema}.matches m
+            WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+              {exclude_internal_alias_matches}
+            ORDER BY {event_time_expr_without_tournament} DESC NULLS LAST
+            LIMIT :limit
+        """
+
+        query_results: list[Dict[str, object]] = []
+        for query in (
+            sql_with_tournament_name,
+            sql_with_tournament_name_column,
+            sql_without_tournament,
+        ):
+            try:
+                with self.engine.connect() as conn:
+                    query_results = [
+                        dict(row)
+                        for row in conn.execute(
+                            text(query).bindparams(bindparam("team_ids", expanding=True)),
+                            params,
+                        ).mappings().all()
+                    ]
+                break
+            except SQLAlchemyError as exc:
+                if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
+                    raise
+
+        return query_results
+
+    def analytics_team_matches(
+        self,
+        *,
+        snapshot_id: int,
+        team_ids: Sequence[int],
+        limit: int,
+    ) -> Dict[str, Any]:
+        sid = int(snapshot_id)
+        team_ids_sorted = _normalize_id_sequence(team_ids)
+        normalized_limit = max(1, int(limit))
+        cache_key = (sid, tuple(team_ids_sorted), normalized_limit)
+        cached = self._get_ttl_cached_value(
+            self._team_matches_response_cache,
+            cache_key,
+            cache_name="team_matches_response",
+        )
+        if cached is not None:
+            return cached
+
+        if not team_ids_sorted:
+            payload = self._empty_team_matches_payload(sid, team_ids_sorted)
+            self._set_ttl_cached_value(
+                self._team_matches_response_cache,
+                cache_key,
+                payload,
+                ttl_seconds=self._READ_RESPONSE_TTL_SECONDS,
+            )
+            return payload
+
         def _safe_float(value: Any) -> Optional[float]:
             if value is None:
                 return None
@@ -4886,94 +5282,14 @@ class TeamSearchStore:
             except (TypeError, ValueError):
                 return None
 
-        def _run_team_match_query() -> list[Dict[str, object]]:
-            sql_with_tournament_name = f"""
-                SELECT
-                    m.match_id,
-                    m.tournament_id,
-                    t.tournament_name,
-                    m.team1_id,
-                    m.team2_id,
-                    {winner_score_select}
-                    ,
-                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
-                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
-                    t.tags AS tournament_tags,
-                    {event_time_expr} AS event_time_ms
-                FROM {self.schema}.matches m
-                LEFT JOIN {self.schema}.tournaments t
-                  ON t.tournament_id = m.tournament_id
-                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
-                  {exclude_internal_alias_matches}
-                ORDER BY {event_time_expr} DESC NULLS LAST
-                LIMIT :limit
-            """
-
-            sql_with_tournament_name_column = f"""
-                SELECT
-                    m.match_id,
-                    m.tournament_id,
-                    t.name AS tournament_name,
-                    m.team1_id,
-                    m.team2_id,
-                    {winner_score_select}
-                    ,
-                    NULLIF(btrim(t.format_hint), '') AS tournament_mode,
-                    NULLIF(btrim(t.map_picking_style), '') AS map_picking_style,
-                    t.tags AS tournament_tags,
-                    {event_time_expr} AS event_time_ms
-                FROM {self.schema}.matches m
-                LEFT JOIN {self.schema}.tournaments t
-                  ON t.tournament_id = m.tournament_id
-                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
-                  {exclude_internal_alias_matches}
-                ORDER BY {event_time_expr} DESC NULLS LAST
-                LIMIT :limit
-            """
-
-            sql_without_tournament = f"""
-                SELECT
-                    m.match_id,
-                    m.tournament_id,
-                    NULL::text AS tournament_name,
-                    m.team1_id,
-                    m.team2_id,
-                    {winner_score_select}
-                    ,
-                    NULL::text AS tournament_mode,
-                    NULL::text AS map_picking_style,
-                    NULL::jsonb AS tournament_tags,
-                    {event_time_expr_without_tournament} AS event_time_ms
-                FROM {self.schema}.matches m
-                WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
-                  {exclude_internal_alias_matches}
-                ORDER BY {event_time_expr_without_tournament} DESC NULLS LAST
-                LIMIT :limit
-            """
-
-            query_results: list[Dict[str, object]] = []
-            for query in (
-                sql_with_tournament_name,
-                sql_with_tournament_name_column,
-                sql_without_tournament,
-            ):
-                try:
-                    with self.engine.connect() as conn:
-                        query_results = [
-                            dict(row)
-                            for row in conn.execute(
-                                text(query).bindparams(bindparam("team_ids", expanding=True)),
-                                params,
-                            ).mappings().all()
-                        ]
-                    break
-                except SQLAlchemyError as exc:
-                    if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
-                        raise
-
-            return query_results
-
-        rows = _run_team_match_query()
+        start_total = time.perf_counter()
+        primary_team_id = int(team_ids_sorted[0])
+        base_rows_start = time.perf_counter()
+        rows = self._fetch_team_match_base_rows(
+            team_ids=team_ids_sorted,
+            limit=normalized_limit,
+        )
+        base_rows_ms = (time.perf_counter() - base_rows_start) * 1000.0
 
         opponent_ids_sorted = sorted(
             {
@@ -4984,16 +5300,23 @@ class TeamSearchStore:
             }
         )
 
+        roster_start = time.perf_counter()
         match_rosters = self._fetch_match_rosters(
             rows,
             team_ids_sorted,
             opponent_ids_sorted,
         )
+        roster_ms = (time.perf_counter() - roster_start) * 1000.0
+
+        rounds_start = time.perf_counter()
         match_rounds = self._fetch_match_rounds(
             rows,
             team_ids_sorted,
             opponent_ids_sorted,
         )
+        rounds_ms = (time.perf_counter() - rounds_start) * 1000.0
+
+        tournament_scores_start = time.perf_counter()
         tournament_scores = self._fetch_tournament_scores(
             [
                 int(row["tournament_id"])
@@ -5001,35 +5324,15 @@ class TeamSearchStore:
                 if row.get("tournament_id") is not None
             ]
         )
-
-        team_name_rows = []
         name_lookup_ids = team_ids_sorted + opponent_ids_sorted
-        if snapshot_id is not None and name_lookup_ids:
-            try:
-                with self.engine.connect() as conn:
-                    team_name_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT team_id, team_name
-                              FROM {self.schema}.team_search_embeddings
-                             WHERE snapshot_id = :snapshot_id
-                               AND team_id IN :team_ids
-                            """
-                        ).bindparams(bindparam("team_ids", expanding=True)),
-                        {
-                            "snapshot_id": int(snapshot_id),
-                            "team_ids": name_lookup_ids,
-                        },
-                    ).mappings().all()
-            except SQLAlchemyError as exc:
-                if not (_is_missing_relation_error(exc) or _is_missing_column_error(exc)):
-                    raise
+        tournament_scores_ms = (time.perf_counter() - tournament_scores_start) * 1000.0
 
-        team_names = {
-            int(row["team_id"]): str(row["team_name"])
-            for row in team_name_rows
-            if row is not None and row.get("team_id") is not None
-        }
+        team_names_start = time.perf_counter()
+        team_names = self._get_cached_snapshot_team_names(
+            sid,
+            name_lookup_ids,
+        )
+        team_names_ms = (time.perf_counter() - team_names_start) * 1000.0
         selected_team_names = [
             team_names.get(team_id, f"Team {team_id}")
             for team_id in team_ids_sorted
@@ -5058,6 +5361,7 @@ class TeamSearchStore:
         tournament_tier_by_id: Dict[int, dict[str, str]] = {}
         team_id_set = set(team_ids_sorted)
         matches_out = []
+        assemble_start = time.perf_counter()
 
         for row in rows:
             team1_id = int(row["team1_id"]) if row.get("team1_id") is not None else None
@@ -5231,11 +5535,32 @@ class TeamSearchStore:
             if decided > 0:
                 summary["win_rate"] = round(summary["wins"] / decided, 4)
 
-        return {
-            "snapshot_id": snapshot_id,
+        assemble_ms = (time.perf_counter() - assemble_start) * 1000.0
+        payload = {
+            "snapshot_id": sid,
             "summary": summary,
             "matches": matches_out,
         }
+        self._set_ttl_cached_value(
+            self._team_matches_response_cache,
+            cache_key,
+            payload,
+            ttl_seconds=self._READ_RESPONSE_TTL_SECONDS,
+        )
+        logger.debug(
+            "analytics_team_matches schema=%s snapshot_id=%s team_count=%s base_rows_ms=%.1f roster_ms=%.1f rounds_ms=%.1f tournament_scores_ms=%.1f team_names_ms=%.1f assemble_ms=%.1f total_ms=%.1f",
+            self.schema,
+            sid,
+            len(team_ids_sorted),
+            base_rows_ms,
+            roster_ms,
+            rounds_ms,
+            tournament_scores_ms,
+            team_names_ms,
+            assemble_ms,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload
 
     def _resolve_team_lab_scope(
         self,
@@ -5246,15 +5571,92 @@ class TeamSearchStore:
     ) -> tuple[list[int], str | None]:
         from team_api.team_lab_service import resolve_team_lab_scope
 
+        sid = int(snapshot_id)
+        cache_key = (sid, str(profile), int(team_id))
+        with self._cache_lock:
+            cached = self._team_lab_scope_cache.get(cache_key)
+            if cached is not None:
+                logger.debug(
+                    "team_lab_scope_cache_hit schema=%s snapshot_id=%s profile=%s team_id=%s",
+                    self.schema,
+                    sid,
+                    profile,
+                    int(team_id),
+                )
+                return list(cached[0]), cached[1]
+
         cache_entry = self._get_cached_snapshot_entry(snapshot_id)
-        return resolve_team_lab_scope(
+        resolved = resolve_team_lab_scope(
             snapshot_rows=cache_entry.rows,
             search_similar_teams=self.search_similar_teams,
             normalize_ids=_normalize_id_sequence,
-            snapshot_id=int(snapshot_id),
+            snapshot_id=sid,
             profile=str(profile),
             team_id=int(team_id),
         )
+        with self._cache_lock:
+            self._team_lab_scope_cache[cache_key] = (list(resolved[0]), resolved[1])
+        return resolved
+
+    def _get_cached_snapshot_team_names(
+        self,
+        snapshot_id: int,
+        team_ids: Sequence[int],
+    ) -> Dict[int, str]:
+        from team_api.team_lab_service import fetch_snapshot_team_names
+
+        sid = int(snapshot_id)
+        normalized_ids = _normalize_id_sequence(team_ids)
+        if not normalized_ids:
+            return {}
+
+        cached_names: Dict[int, str] = {}
+        missing_ids: list[int] = []
+        with self._cache_lock:
+            snapshot_cache = self._snapshot_team_name_cache.setdefault(sid, {})
+            for team_id in normalized_ids:
+                if team_id in snapshot_cache:
+                    cached_names[team_id] = snapshot_cache[team_id]
+                else:
+                    missing_ids.append(team_id)
+
+        if not missing_ids:
+            logger.debug(
+                "snapshot_team_name_cache_hit schema=%s snapshot_id=%s teams=%s",
+                self.schema,
+                sid,
+                len(cached_names),
+            )
+            return cached_names
+
+        fetched_names = fetch_snapshot_team_names(
+            engine=self.engine,
+            schema=self.schema,
+            snapshot_id=sid,
+            team_ids=missing_ids,
+            normalize_ids=_normalize_id_sequence,
+            is_missing_relation_error=_is_missing_relation_error,
+            is_missing_column_error=_is_missing_column_error,
+        )
+        if fetched_names:
+            with self._cache_lock:
+                snapshot_cache = self._snapshot_team_name_cache.setdefault(sid, {})
+                snapshot_cache.update(fetched_names)
+                cached_names.update(
+                    {
+                        team_id: snapshot_cache[team_id]
+                        for team_id in normalized_ids
+                        if team_id in snapshot_cache
+                    }
+                )
+        logger.debug(
+            "snapshot_team_name_lookup schema=%s snapshot_id=%s requested=%s resolved=%s",
+            self.schema,
+            sid,
+            len(normalized_ids),
+            len(cached_names),
+        )
+        return cached_names
 
     def _fetch_team_lab_match_rows(
         self,
@@ -5314,32 +5716,68 @@ class TeamSearchStore:
     ) -> Optional[Dict[str, Any]]:
         from team_api.analytics_logic import build_team_lab
 
-        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        sid = int(snapshot_id)
+        normalized_neighbors = max(1, int(neighbors))
+        cache_key = (sid, str(profile), int(team_id), normalized_neighbors)
+        cached = self._get_ttl_cached_value(
+            self._team_lab_response_cache,
+            cache_key,
+            cache_name="team_lab_response",
+        )
+        if cached is not None:
+            return cached
+
+        start_total = time.perf_counter()
+        scope_start = time.perf_counter()
+        cache_entry = self._get_cached_snapshot_entry(sid)
         embeddings = cache_entry.rows
-        cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
+        cluster_map = self._get_cached_cluster_map(sid, profile)
         scoped_team_ids, scoped_team_name = self._resolve_team_lab_scope(
-            snapshot_id=int(snapshot_id),
+            snapshot_id=sid,
             profile=str(profile),
             team_id=int(team_id),
         )
+        scope_ms = (time.perf_counter() - scope_start) * 1000.0
+        matches_start = time.perf_counter()
         match_rows = self._fetch_team_lab_match_rows(team_ids=scoped_team_ids)
+        match_rows_ms = (time.perf_counter() - matches_start) * 1000.0
+        build_start = time.perf_counter()
 
         result = build_team_lab(
             team_id=int(team_id),
             embeddings=embeddings,
             cluster_map=cluster_map,
             matches=match_rows,
-            neighbors=max(1, int(neighbors)),
+            neighbors=normalized_neighbors,
             team_ids=scoped_team_ids,
             team_name=scoped_team_name,
         )
+        build_ms = (time.perf_counter() - build_start) * 1000.0
         if result is None:
             return None
-        return {
-            "snapshot_id": snapshot_id,
+        payload = {
+            "snapshot_id": sid,
             "cluster_mode": profile,
             **result,
         }
+        self._set_ttl_cached_value(
+            self._team_lab_response_cache,
+            cache_key,
+            payload,
+            ttl_seconds=self._READ_RESPONSE_TTL_SECONDS,
+        )
+        logger.debug(
+            "analytics_team_lab schema=%s snapshot_id=%s profile=%s team_id=%s scope_ms=%.1f match_rows_ms=%.1f build_ms=%.1f total_ms=%.1f",
+            self.schema,
+            sid,
+            profile,
+            int(team_id),
+            scope_ms,
+            match_rows_ms,
+            build_ms,
+            (time.perf_counter() - start_total) * 1000.0,
+        )
+        return payload
 
     def analytics_team_blend(
         self,
