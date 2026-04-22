@@ -2,7 +2,10 @@ import { defineConfig, loadEnv } from 'vite';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
-  const proxyTarget = env.VITE_PROXY_API_TARGET || '';
+  // Vite proxying is local-dev only. Deployed frontend traffic is handled by
+  // nginx in dockerfiles/nginx.frontend.conf, so keep the local default pointed
+  // at the local API unless a dev-specific override is explicitly provided.
+  const proxyTarget = env.VITE_DEV_PROXY_API_TARGET || 'http://127.0.0.1:8000';
   const matchesProxyTarget = env.VITE_MATCHES_PROXY_TARGET || 'https://splat.top';
 
   return {
