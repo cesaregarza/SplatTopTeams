@@ -190,6 +190,39 @@ def test_search_fallback_uses_cached_snapshot_rows():
     assert observed_embeddings[0][1].team_id == 202
 
 
+def test_analytics_team_lab_uses_family_scope_resolution():
+    store = _store()
+    family_a = _row(101, lineup_count=6, roster_player_ids=(1, 2, 3, 4))
+    family_b = _row(102, lineup_count=4, roster_player_ids=(1, 2, 3, 5))
+    outsider = _row(202, lineup_count=8, roster_player_ids=(7, 8, 9, 10))
+    cache_entry = store._build_snapshot_cache_entry(7, [family_a, family_b, outsider])
+
+    store._get_cached_snapshot_entry = lambda snapshot_id: cache_entry  # type: ignore[assignment]
+    store._get_cached_cluster_map = lambda snapshot_id, profile: {}  # type: ignore[assignment]
+    store._resolve_team_lab_scope = lambda snapshot_id, profile, team_id: ([101, 102], "Healbook")  # type: ignore[assignment]
+    store._fetch_team_lab_match_rows = lambda team_ids: [  # type: ignore[assignment]
+        {"opponent_team_id": 202, "is_win": 1},
+        {"opponent_team_id": 202, "is_win": 0},
+    ]
+
+    result = store.analytics_team_lab(
+        snapshot_id=7,
+        profile="family",
+        team_id=101,
+        neighbors=5,
+    )
+
+    assert result is not None
+    assert result["cluster_mode"] == "family"
+    assert result["team"]["team_id"] == 101
+    assert result["team"]["team_name"] == "Healbook"
+    assert result["team"]["team_ids"] == [101, 102]
+    assert result["team"]["selected_team_count"] == 2
+    assert result["team"]["lineup_count"] == 10
+    assert result["match_summary"]["matches"] == 2
+    assert result["neighbors"][0]["team_id"] == 202
+
+
 def test_list_tournament_teams_falls_back_to_sendou_when_snapshot_missing():
     store = _store()
     store._fetch_rows = lambda sql, params, missing_default=None: []  # type: ignore[assignment]

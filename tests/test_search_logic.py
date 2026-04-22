@@ -629,7 +629,9 @@ def test_consolidate_ranked_results_exposes_sorted_core_lineup_players():
     assert len(out) == 1
     rep = out[0]
     assert rep["is_consolidated"] is True
+    assert rep["lineup_count"] == 20
     assert rep["match_count"] == 20
+    assert rep["top_lineup_match_count"] <= rep["lineup_count"]
     core_players = rep["core_lineup_players"]
     assert [row["player_id"] for row in core_players] == [1, 2, 3, 4, 5, 6]
     assert [row["matches_played"] for row in core_players] == [9, 9, 9, 9, 6, 3]

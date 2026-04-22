@@ -860,6 +860,7 @@ def consolidate_ranked_results(
             if merged_lineup_variant_counts
             else int(rep.get("distinct_lineup_count", 0) or 0)
         )
+        rep["lineup_count"] = total_match_count
         rep["match_count"] = total_match_count
         rep["tournament_count"] = total_tournament_count
         rep["consolidated_teams"] = aliases

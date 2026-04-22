@@ -22,6 +22,10 @@ def _row(
     *,
     top_player_ids: tuple[int, ...] = (),
     top_player_names: tuple[str, ...] = (),
+    roster_player_ids: tuple[int, ...] = (),
+    roster_player_names: tuple[str, ...] = (),
+    roster_player_match_counts: tuple[int, ...] = (),
+    lineup_variant_counts: dict[tuple[int, ...], int] | None = None,
     lineup_count: int,
     distinct: int,
     top_share: float,
@@ -40,7 +44,11 @@ def _row(
         top_lineup_summary="",
         top_lineup_player_ids=top_player_ids,
         top_lineup_player_names=top_player_names,
-        unique_player_count=4,
+        roster_player_ids=roster_player_ids,
+        roster_player_names=roster_player_names,
+        roster_player_match_counts=roster_player_match_counts,
+        lineup_variant_counts=dict(lineup_variant_counts or {}),
+        unique_player_count=len(roster_player_ids) or 4,
         distinct_lineup_count=distinct,
         top_lineup_share=top_share,
         lineup_entropy=entropy,
@@ -137,6 +145,79 @@ def test_build_team_lab_returns_neighbors_and_match_summary():
     assert out["team"]["team_id"] == 1
     assert out["match_summary"]["matches"] == 2
     assert out["neighbors"][0]["team_id"] == 2
+
+
+def test_build_team_lab_aggregates_family_scope():
+    rows = [
+        _row(
+            1,
+            "Healbook",
+            [1.0, 0.0],
+            top_player_ids=(10, 11, 12, 13),
+            top_player_names=("Jovan", "prosper", "adapt", "Len."),
+            roster_player_ids=(10, 11, 12, 13, 14),
+            roster_player_names=("Jovan", "prosper", "adapt", "Len.", "Cakes"),
+            roster_player_match_counts=(6, 6, 6, 5, 1),
+            lineup_variant_counts={(10, 11, 12, 13): 4, (10, 11, 12, 14): 2},
+            lineup_count=6,
+            distinct=2,
+            top_share=4 / 6,
+            entropy=0.6,
+        ),
+        _row(
+            2,
+            "WE as in HealBook",
+            [0.95, 0.05],
+            top_player_ids=(10, 11, 12, 13),
+            top_player_names=("Jovan", "prosper", "adapt", "Len."),
+            roster_player_ids=(10, 11, 12, 13),
+            roster_player_names=("Jovan", "prosper", "adapt", "Len."),
+            roster_player_match_counts=(4, 4, 4, 4),
+            lineup_variant_counts={(10, 11, 12, 13): 3, (10, 11, 12, 15): 1},
+            lineup_count=4,
+            distinct=2,
+            top_share=3 / 4,
+            entropy=0.5,
+        ),
+        _row(
+            3,
+            "BlankZ",
+            [0.1, 0.9],
+            top_player_ids=(20, 21, 22, 23),
+            top_player_names=("A", "B", "C", "D"),
+            lineup_count=8,
+            distinct=3,
+            top_share=0.5,
+            entropy=0.4,
+        ),
+    ]
+    cluster_map = {}
+    matches = [
+        {"opponent_team_id": 3, "is_win": 1},
+        {"opponent_team_id": 3, "is_win": 0},
+    ]
+
+    out = build_team_lab(
+        team_id=1,
+        team_ids=[1, 2],
+        team_name="Healbook",
+        embeddings=rows,
+        cluster_map=cluster_map,
+        matches=matches,
+        neighbors=5,
+    )
+
+    assert out is not None
+    assert out["team"]["team_id"] == 1
+    assert out["team"]["team_name"] == "Healbook"
+    assert out["team"]["team_ids"] == [1, 2]
+    assert out["team"]["selected_team_count"] == 2
+    assert out["team"]["lineup_count"] == 10
+    assert out["team"]["match_count"] == 10
+    assert out["team"]["distinct_lineup_count"] == 3
+    assert out["team"]["top_lineup_share_pct"] == 70.0
+    assert out["match_summary"]["matches"] == 2
+    assert out["neighbors"][0]["team_id"] == 3
 
 
 def test_compute_space_projection_returns_points_and_centroids():

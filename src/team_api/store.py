@@ -5237,6 +5237,97 @@ class TeamSearchStore:
             "matches": matches_out,
         }
 
+    def _resolve_team_lab_scope(
+        self,
+        *,
+        snapshot_id: int,
+        profile: str,
+        team_id: int,
+    ) -> tuple[list[int], str | None]:
+        primary_team_id = int(team_id)
+        cache_entry = self._get_cached_snapshot_entry(snapshot_id)
+        base_row = next(
+            (row for row in cache_entry.rows if int(row.team_id) == primary_team_id),
+            None,
+        )
+
+        if str(profile) != "family":
+            return [primary_team_id], (base_row.team_name if base_row is not None else None)
+
+        try:
+            ranked = self.search_similar_teams(
+                snapshot_id=snapshot_id,
+                query=str(primary_team_id),
+                top_n=60,
+                min_relevance=0.0,
+                cluster_mode=profile,
+                include_clusters=True,
+                consolidate=True,
+                consolidate_min_overlap=0.8,
+            )
+        except Exception:
+            ranked = {"results": []}
+
+        for result in ranked.get("results", []):
+            resolved_team_ids = _normalize_id_sequence(
+                [
+                    result.get("team_id"),
+                    *(result.get("consolidated_team_ids") or []),
+                ]
+            )
+            if primary_team_id not in resolved_team_ids:
+                continue
+            return resolved_team_ids, str(
+                result.get("team_name")
+                or (base_row.team_name if base_row is not None else f"Team {primary_team_id}")
+            )
+
+        return [primary_team_id], (base_row.team_name if base_row is not None else None)
+
+    def _fetch_team_lab_match_rows(
+        self,
+        *,
+        team_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        scoped_team_ids = _normalize_id_sequence(team_ids)
+        if not scoped_team_ids:
+            return []
+
+        exclude_internal_alias_matches = ""
+        if len(scoped_team_ids) > 1:
+            exclude_internal_alias_matches = """
+              AND NOT (m.team1_id IN :team_ids AND m.team2_id IN :team_ids)
+            """.rstrip()
+
+        sql = f"""
+            SELECT
+                CASE
+                    WHEN m.team1_id IN :team_ids THEN m.team2_id
+                    ELSE m.team1_id
+                END AS opponent_team_id,
+                CASE
+                    WHEN m.winner_team_id IN :team_ids THEN 1
+                    ELSE 0
+                END AS is_win
+            FROM {self.schema}.matches m
+            WHERE (m.team1_id IN :team_ids OR m.team2_id IN :team_ids)
+              AND m.winner_team_id IS NOT NULL
+              {exclude_internal_alias_matches}
+        """
+        try:
+            with self.engine.connect() as conn:
+                return [
+                    dict(row)
+                    for row in conn.execute(
+                        text(sql).bindparams(bindparam("team_ids", expanding=True)),
+                        {"team_ids": scoped_team_ids},
+                    ).mappings().all()
+                ]
+        except SQLAlchemyError as exc:
+            if _is_missing_relation_error(exc):
+                return []
+            raise
+
     def analytics_roster_diversity(
         self,
         *,
@@ -5283,26 +5374,12 @@ class TeamSearchStore:
         cache_entry = self._get_cached_snapshot_entry(snapshot_id)
         embeddings = cache_entry.rows
         cluster_map = self._get_cached_cluster_map(snapshot_id, profile)
-
-        sql = f"""
-            SELECT
-                CASE
-                    WHEN m.team1_id = :team_id THEN m.team2_id
-                    ELSE m.team1_id
-                END AS opponent_team_id,
-                CASE
-                    WHEN m.winner_team_id = :team_id THEN 1
-                    ELSE 0
-                END AS is_win
-            FROM {self.schema}.matches m
-            WHERE (m.team1_id = :team_id OR m.team2_id = :team_id)
-              AND m.winner_team_id IS NOT NULL
-        """
-        match_rows = self._fetch_rows(
-            sql,
-            {"team_id": int(team_id)},
-            missing_default=[],
+        scoped_team_ids, scoped_team_name = self._resolve_team_lab_scope(
+            snapshot_id=int(snapshot_id),
+            profile=str(profile),
+            team_id=int(team_id),
         )
+        match_rows = self._fetch_team_lab_match_rows(team_ids=scoped_team_ids)
 
         result = build_team_lab(
             team_id=int(team_id),
@@ -5310,6 +5387,8 @@ class TeamSearchStore:
             cluster_map=cluster_map,
             matches=match_rows,
             neighbors=max(1, int(neighbors)),
+            team_ids=scoped_team_ids,
+            team_name=scoped_team_name,
         )
         if result is None:
             return None

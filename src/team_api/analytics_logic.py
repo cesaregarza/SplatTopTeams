@@ -69,6 +69,20 @@ def _resolve_cluster_id(
     return int(cluster_map[team_id]["cluster_id"])
 
 
+def _resolve_shared_cluster_id(
+    team_ids: Iterable[int],
+    cluster_map: Dict[int, Dict[str, Any]],
+) -> Optional[int]:
+    cluster_ids = {
+        cluster_id
+        for team_id in team_ids
+        if (cluster_id := _resolve_cluster_id(int(team_id), cluster_map)) is not None
+    }
+    if len(cluster_ids) != 1:
+        return None
+    return next(iter(cluster_ids))
+
+
 def _player_ids(row: EmbeddingRow) -> tuple[int, ...]:
     ids = []
     for value in row.top_lineup_player_ids:
@@ -123,6 +137,190 @@ def _player_details(
             }
         )
     return details
+
+
+def _estimate_top_lineup_matches(row: EmbeddingRow) -> int:
+    if row.lineup_variant_counts:
+        return max(int(count) for count in row.lineup_variant_counts.values())
+    if row.lineup_count <= 0:
+        return 0
+    estimated = int(round(float(row.top_lineup_share or 0.0) * float(row.lineup_count)))
+    if estimated <= 0 and row.top_lineup_player_ids:
+        estimated = 1
+    return max(0, min(int(row.lineup_count), estimated))
+
+
+def _merge_lineup_variant_counts(
+    rows: Sequence[EmbeddingRow],
+) -> Dict[tuple[int, ...], int]:
+    merged: Dict[tuple[int, ...], int] = defaultdict(int)
+    for row in rows:
+        if row.lineup_variant_counts:
+            for signature, count in row.lineup_variant_counts.items():
+                if not signature:
+                    continue
+                merged[tuple(int(pid) for pid in signature)] += int(count)
+            continue
+        signature = tuple(int(pid) for pid in row.top_lineup_player_ids if int(pid) > 0)
+        if not signature:
+            continue
+        merged[signature] += _estimate_top_lineup_matches(row)
+    return dict(merged)
+
+
+def _lineup_metrics(
+    lineup_variant_counts: Dict[tuple[int, ...], int],
+    total_lineup_count: int,
+) -> tuple[int, float, float, float, tuple[int, ...], int]:
+    if total_lineup_count <= 0 or not lineup_variant_counts:
+        return 0, 0.0, 0.0, 0.0, (), 0
+
+    counts = np.asarray(
+        [max(0, int(count)) for count in lineup_variant_counts.values()],
+        dtype=np.float64,
+    )
+    counts = counts[counts > 0]
+    if counts.size == 0:
+        return 0, 0.0, 0.0, 0.0, (), 0
+
+    total = float(max(1, total_lineup_count))
+    probabilities = counts / total
+    entropy = float(-np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1.0))))
+    effective = float(np.exp(entropy)) if entropy > 0.0 else (1.0 if counts.size > 0 else 0.0)
+    chosen_signature, chosen_count = max(
+        lineup_variant_counts.items(),
+        key=lambda item: (int(item[1]), tuple(int(pid) for pid in item[0])),
+    )
+    top_count = int(max(0, chosen_count))
+    top_share = top_count / total if total > 0 else 0.0
+    return len(lineup_variant_counts), float(top_share), entropy, effective, tuple(int(pid) for pid in chosen_signature), top_count
+
+
+def _aggregate_roster_rows(
+    rows: Sequence[EmbeddingRow],
+) -> tuple[Dict[int, int], Dict[int, str]]:
+    roster_counts: Dict[int, int] = defaultdict(int)
+    name_lookup: Dict[int, str] = {}
+
+    for row in rows:
+        if row.roster_player_ids and row.roster_player_match_counts:
+            for idx, raw_pid in enumerate(row.roster_player_ids):
+                try:
+                    pid = int(raw_pid)
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0:
+                    continue
+                matches = (
+                    int(row.roster_player_match_counts[idx])
+                    if idx < len(row.roster_player_match_counts)
+                    else 0
+                )
+                roster_counts[pid] += matches
+                if pid not in name_lookup:
+                    name = ""
+                    if idx < len(row.roster_player_names):
+                        name = str(row.roster_player_names[idx] or "").strip()
+                    if not name:
+                        name = _player_names(row).get(pid, f"Player {pid}")
+                    name_lookup[pid] = name
+            continue
+
+        estimated = _estimate_top_lineup_matches(row)
+        for pid, name in _player_names(row).items():
+            roster_counts[pid] += estimated
+            name_lookup.setdefault(pid, name)
+
+    return dict(roster_counts), name_lookup
+
+
+def _aggregate_embedding_rows(
+    *,
+    primary_team_id: int,
+    team_name: str,
+    rows: Sequence[EmbeddingRow],
+) -> EmbeddingRow:
+    if not rows:
+        raise ValueError("rows must not be empty")
+
+    finals = np.stack([row.final_vector for row in rows], axis=0)
+    semantics = np.stack([row.semantic_vector for row in rows], axis=0)
+    identities = np.stack([row.identity_vector for row in rows], axis=0)
+
+    final_vector = _normalize(np.mean(finals, axis=0))
+    semantic_vector = _normalize(np.mean(semantics, axis=0))
+    identity_vector = _normalize(np.mean(identities, axis=0))
+
+    total_lineup_count = int(sum(max(0, int(row.lineup_count)) for row in rows))
+    lineup_variant_counts = _merge_lineup_variant_counts(rows)
+    (
+        distinct_lineup_count,
+        top_lineup_share,
+        lineup_entropy,
+        effective_lineups,
+        chosen_signature,
+        chosen_count,
+    ) = _lineup_metrics(lineup_variant_counts, total_lineup_count)
+
+    roster_counts, roster_name_lookup = _aggregate_roster_rows(rows)
+    if not roster_counts:
+        for row in rows:
+            for pid, name in _player_names(row).items():
+                roster_counts[pid] = roster_counts.get(pid, 0) + _estimate_top_lineup_matches(row)
+                roster_name_lookup.setdefault(pid, name)
+
+    roster_sorted = sorted(
+        roster_counts.items(),
+        key=lambda item: (-int(item[1]), int(item[0])),
+    )
+    roster_player_ids = tuple(int(pid) for pid, _ in roster_sorted)
+    roster_player_match_counts = tuple(int(count) for _, count in roster_sorted)
+    roster_player_names = tuple(
+        str(roster_name_lookup.get(pid, f"Player {pid}"))
+        for pid in roster_player_ids
+    )
+
+    top_lineup_player_names = tuple(
+        str(roster_name_lookup.get(pid, f"Player {pid}"))
+        for pid in chosen_signature
+    )
+    tournament_ids = {
+        int(row.tournament_id)
+        for row in rows
+        if row.tournament_id is not None
+    }
+    tournament_count = len(tournament_ids) if tournament_ids else int(
+        sum(max(0, int(row.tournament_count)) for row in rows)
+    )
+    event_time_ms = max(int(row.event_time_ms or 0) for row in rows) or None
+
+    return EmbeddingRow(
+        team_id=int(primary_team_id),
+        tournament_id=None,
+        team_name=str(team_name or rows[0].team_name),
+        event_time_ms=event_time_ms,
+        lineup_count=int(total_lineup_count),
+        semantic_vector=semantic_vector,
+        identity_vector=identity_vector,
+        final_vector=final_vector,
+        top_lineup_summary=(
+            f"{chosen_count}x:{','.join(top_lineup_player_names)}"
+            if chosen_signature and chosen_count > 0
+            else ""
+        ),
+        unique_player_count=len(roster_player_ids),
+        distinct_lineup_count=int(distinct_lineup_count),
+        top_lineup_share=float(top_lineup_share),
+        lineup_entropy=float(lineup_entropy),
+        effective_lineups=float(effective_lineups),
+        top_lineup_player_ids=tuple(int(pid) for pid in chosen_signature),
+        top_lineup_player_names=top_lineup_player_names,
+        roster_player_ids=roster_player_ids,
+        roster_player_names=roster_player_names,
+        roster_player_match_counts=roster_player_match_counts,
+        lineup_variant_counts=lineup_variant_counts,
+        tournament_count=int(tournament_count),
+    )
 
 
 def _jaccard(a: set[int], b: set[int]) -> float:
@@ -627,28 +825,28 @@ def summarize_matchups(
 
 def _neighbors_by_query(
     *,
-    team_id: int,
+    excluded_team_ids: Sequence[int],
     embeddings: Sequence[EmbeddingRow],
     cluster_map: Dict[int, Dict[str, Any]],
     query_vec: np.ndarray,
+    query_semantic_vec: np.ndarray,
+    query_identity_vec: np.ndarray,
     candidate_vectors: np.ndarray,
     neighbors: int,
 ) -> List[Dict[str, Any]]:
     sims = candidate_vectors @ query_vec
-    team_ids = [row.team_id for row in embeddings]
     sem_vecs = np.stack([row.semantic_vector for row in embeddings], axis=0)
     id_vecs = np.stack([row.identity_vector for row in embeddings], axis=0)
-
-    target = next(row for row in embeddings if row.team_id == team_id)
-    sem_sims = sem_vecs @ target.semantic_vector
-    id_sims = id_vecs @ target.identity_vector
+    excluded_ids = {int(team_id) for team_id in excluded_team_ids}
+    sem_sims = sem_vecs @ query_semantic_vec
+    id_sims = id_vecs @ query_identity_vec
 
     order = np.argsort(-sims)
     out: List[Dict[str, Any]] = []
     for position in order:
         idx = int(position)
         row = embeddings[idx]
-        if row.team_id == team_id:
+        if row.team_id in excluded_ids:
             continue
         out.append(
             {
@@ -674,18 +872,40 @@ def build_team_lab(
     cluster_map: Dict[int, Dict[str, Any]],
     matches: Iterable[Dict[str, Any]],
     neighbors: int,
+    team_ids: Sequence[int] | None = None,
+    team_name: str | None = None,
 ) -> Dict[str, Any] | None:
     team_lookup = {row.team_id: row for row in embeddings}
-    target = team_lookup.get(team_id)
-    if target is None:
+    selected_team_ids = [int(team_id)]
+    if team_ids:
+        selected_team_ids = sorted({int(value) for value in team_ids if int(value) > 0})
+
+    target_rows = [
+        team_lookup[int(selected_team_id)]
+        for selected_team_id in selected_team_ids
+        if int(selected_team_id) in team_lookup
+    ]
+    if not target_rows:
         return None
+
+    if len(target_rows) == 1 and int(target_rows[0].team_id) == int(team_id):
+        target = target_rows[0]
+    else:
+        target = _aggregate_embedding_rows(
+            primary_team_id=int(team_id),
+            team_name=str(team_name or target_rows[0].team_name),
+            rows=target_rows,
+        )
+    excluded_team_ids = sorted({int(row.team_id) for row in target_rows})
 
     vectors = np.stack([row.final_vector for row in embeddings], axis=0)
     neighbors_out = _neighbors_by_query(
-        team_id=team_id,
+        excluded_team_ids=excluded_team_ids,
         embeddings=embeddings,
         cluster_map=cluster_map,
         query_vec=target.final_vector,
+        query_semantic_vec=target.semantic_vector,
+        query_identity_vec=target.identity_vector,
         candidate_vectors=vectors,
         neighbors=neighbors,
     )
@@ -695,7 +915,7 @@ def build_team_lab(
         1.0 - float(np.mean(top_neighbor_sims)) if top_neighbor_sims else 0.0
     )
 
-    own_cluster_id = _resolve_cluster_id(team_id, cluster_map)
+    own_cluster_id = _resolve_shared_cluster_id(excluded_team_ids, cluster_map)
 
     total_matches = 0
     total_wins = 0
@@ -709,7 +929,7 @@ def build_team_lab(
 
     for row in matches:
         opponent_team_id = int(row["opponent_team_id"])
-        if opponent_team_id == team_id:
+        if opponent_team_id in excluded_team_ids:
             continue
         is_win = int(row["is_win"])
         total_matches += 1
@@ -751,16 +971,25 @@ def build_team_lab(
         "team_id": target.team_id,
         "team_name": target.team_name,
         "lineup_count": target.lineup_count,
+        "match_count": target.lineup_count,
         "distinct_lineup_count": target.distinct_lineup_count,
         "lineup_entropy": round(target.lineup_entropy, 4),
         "top_lineup_share_pct": _to_percent(target.top_lineup_share),
         "effective_lineups": round(target.effective_lineups, 4),
         "volatility_score": round(_volatility_score(target), 4),
         "uniqueness_score": round(max(0.0, uniqueness_score), 4),
+        "team_ids": excluded_team_ids,
+        "selected_team_count": len(excluded_team_ids),
         "cluster_id": own_cluster_id,
         "cluster_size": (
-            int(cluster_map[team_id]["cluster_size"])
-            if team_id in cluster_map
+            int(
+                next(
+                    cluster_map[int(member_team_id)]["cluster_size"]
+                    for member_team_id in excluded_team_ids
+                    if int(member_team_id) in cluster_map
+                )
+            )
+            if own_cluster_id is not None
             else None
         ),
     }
@@ -817,10 +1046,12 @@ def build_blended_neighbors(
     )
 
     neighbors_out = _neighbors_by_query(
-        team_id=team_id,
+        excluded_team_ids=[team_id],
         embeddings=embeddings,
         cluster_map=cluster_map,
         query_vec=blend_query,
+        query_semantic_vec=target.semantic_vector,
+        query_identity_vec=target.identity_vector,
         candidate_vectors=blend_matrix,
         neighbors=neighbors,
     )
