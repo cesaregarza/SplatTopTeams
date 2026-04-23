@@ -102,13 +102,17 @@ export function useTeamExplorerData({
         }),
       ]);
 
-      let matchedRow = null;
       const teamLabValue = teamPayload.status === 'fulfilled' ? teamPayload.value : null;
-      let teamProfileValue = null;
+      const analyticsProfileValue = teamLabValue?.team || null;
+      const analyticsScopedIds = uniqueTeamIds(parseTeamIdList(teamLabValue?.team?.team_ids));
+      let matchedRow = null;
+      let teamProfileValue = analyticsProfileValue;
       if (searchPayload.status === 'fulfilled') {
         const searchRows = searchPayload.value?.results || [];
         matchedRow = resolveTeamProfileRow(searchRows, requestedIds);
-        teamProfileValue = matchedRow || searchRows[0] || null;
+        if (!teamProfileValue) {
+          teamProfileValue = matchedRow || searchRows[0] || null;
+        }
       }
 
       let partialWarning = '';
@@ -119,7 +123,11 @@ export function useTeamExplorerData({
         throw teamPayload.reason || searchPayload.reason || new Error('Failed to load team detail');
       }
 
-      const effectiveIds = resolveScopedTeamIds(requestedIds, matchedRow, teamScope);
+      const effectiveIds = (
+        teamScope === 'family' && analyticsScopedIds.length
+      )
+        ? analyticsScopedIds
+        : resolveScopedTeamIds(requestedIds, matchedRow, teamScope);
       let matchHistoryValue = null;
       let matchHistoryError = '';
 
@@ -278,6 +286,14 @@ export function useTeamExplorerData({
   const continuityHint = continuityLabel(topLineupShare, distinctLineupCount);
   const actionSnapshotId = detailState.matchHistory?.snapshot_id || normalizedSelectedSnapshotId || null;
   const registrationRows = useMemo(() => {
+    const consolidatedRegistrations = Array.isArray(detailState.teamProfile?.consolidated_teams)
+      ? detailState.teamProfile.consolidated_teams
+      : [];
+    if (consolidatedRegistrations.length) {
+      return consolidatedRegistrations
+        .filter((row) => row?.team_id)
+        .sort((a, b) => Number(b?.event_time_ms || 0) - Number(a?.event_time_ms || 0));
+    }
     const primary = detailState.teamProfile
       ? [{
           team_id: detailState.teamProfile.team_id,

@@ -214,8 +214,17 @@ def test_build_team_lab_aggregates_family_scope():
     assert out["team"]["selected_team_count"] == 2
     assert out["team"]["lineup_count"] == 10
     assert out["team"]["match_count"] == 10
+    assert out["team"]["tournament_count"] == 1
+    assert out["team"]["unique_player_count"] == 5
     assert out["team"]["distinct_lineup_count"] == 3
     assert out["team"]["top_lineup_share_pct"] == 70.0
+    assert out["team"]["top_lineup_match_count"] == 7
+    assert out["team"]["top_lineup_match_share"] == 0.7
+    assert out["team"]["top_lineup_player_names"] == ["Jovan", "prosper", "adapt", "Len."]
+    assert out["team"]["core_lineup_players"][0]["player_name"] == "Jovan"
+    assert out["team"]["core_lineup_players"][0]["matches_played"] == 10
+    assert len(out["team"]["consolidated_teams"]) == 2
+    assert sorted(row["team_id"] for row in out["team"]["consolidated_teams"]) == [1, 2]
     assert out["match_summary"]["matches"] == 2
     assert out["neighbors"][0]["team_id"] == 3
 

@@ -134,6 +134,7 @@ def _player_details(
                 "player_name": str(
                     primary.get(pid, secondary.get(pid, f"Player {int(pid)}"))
                 ),
+                "sendou_url": f"https://sendou.ink/u/{int(pid)}",
             }
         )
     return details
@@ -897,6 +898,45 @@ def build_team_lab(
             rows=target_rows,
         )
     excluded_team_ids = sorted({int(row.team_id) for row in target_rows})
+    roster_player_details = [
+        {
+            "player_id": int(pid),
+            "player_name": str(name),
+            "matches_played": int(count),
+            "sendou_url": f"https://sendou.ink/u/{int(pid)}",
+        }
+        for pid, name, count in zip(
+            target.roster_player_ids,
+            target.roster_player_names,
+            target.roster_player_match_counts,
+        )
+    ]
+    top_lineup_players = _player_details(
+        target.top_lineup_player_ids,
+        _player_names(target),
+        {int(pid): str(name) for pid, name in zip(target.roster_player_ids, target.roster_player_names)},
+    )
+    top_lineup_match_count = _estimate_top_lineup_matches(target)
+    consolidated_rows = sorted(
+        target_rows,
+        key=lambda row: (
+            int(row.event_time_ms or 0),
+            int(row.lineup_count),
+            int(row.team_id),
+        ),
+        reverse=True,
+    )
+    consolidated_teams = [
+        {
+            "team_id": int(row.team_id),
+            "team_name": str(row.team_name),
+            "tournament_id": int(row.tournament_id) if row.tournament_id is not None else None,
+            "event_time_ms": int(row.event_time_ms) if row.event_time_ms is not None else None,
+            "match_count": int(row.lineup_count),
+            "tournament_count": int(row.tournament_count),
+        }
+        for row in consolidated_rows
+    ]
 
     vectors = np.stack([row.final_vector for row in embeddings], axis=0)
     neighbors_out = _neighbors_by_query(
@@ -972,14 +1012,28 @@ def build_team_lab(
         "team_name": target.team_name,
         "lineup_count": target.lineup_count,
         "match_count": target.lineup_count,
+        "tournament_count": int(target.tournament_count),
+        "unique_player_count": int(target.unique_player_count),
         "distinct_lineup_count": target.distinct_lineup_count,
         "lineup_entropy": round(target.lineup_entropy, 4),
         "top_lineup_share_pct": _to_percent(target.top_lineup_share),
+        "top_lineup_share": float(target.top_lineup_share),
+        "top_lineup_match_share": float(target.top_lineup_share),
+        "top_lineup_match_count": int(top_lineup_match_count),
+        "top_lineup_summary": str(target.top_lineup_summary or ""),
+        "top_lineup_player_ids": [int(pid) for pid in target.top_lineup_player_ids],
+        "top_lineup_player_names": [str(name) for name in target.top_lineup_player_names],
+        "top_lineup_players": top_lineup_players,
+        "core_lineup_players": roster_player_details,
+        "event_time_ms": int(target.event_time_ms) if target.event_time_ms is not None else None,
         "effective_lineups": round(target.effective_lineups, 4),
         "volatility_score": round(_volatility_score(target), 4),
         "uniqueness_score": round(max(0.0, uniqueness_score), 4),
         "team_ids": excluded_team_ids,
         "selected_team_count": len(excluded_team_ids),
+        "consolidated_team_ids": [int(row["team_id"]) for row in consolidated_teams],
+        "consolidated_team_names": [str(row["team_name"]) for row in consolidated_teams],
+        "consolidated_teams": consolidated_teams,
         "cluster_id": own_cluster_id,
         "cluster_size": (
             int(
