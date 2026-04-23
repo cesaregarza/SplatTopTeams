@@ -3073,9 +3073,9 @@ class TeamSearchStore:
     def _row_to_embedding(self, row: Dict[str, Any]) -> EmbeddingRow:
         def _coerce_vector(value: Any) -> np.ndarray:
             try:
-                arr = np.asarray(value or [], dtype=np.float64)
+                arr = np.asarray(value or [], dtype=np.float32)
             except (TypeError, ValueError):
-                arr = np.array([], dtype=np.float64)
+                arr = np.array([], dtype=np.float32)
             return arr.reshape(-1)
 
         def _coerce_player_id(value: Any) -> Optional[int]:
@@ -5752,6 +5752,9 @@ class TeamSearchStore:
             neighbors=normalized_neighbors,
             team_ids=scoped_team_ids,
             team_name=scoped_team_name,
+            precomputed_finals=cache_entry.finals,
+            precomputed_semantics=cache_entry.semantics,
+            precomputed_identities=cache_entry.identities,
         )
         build_ms = (time.perf_counter() - build_start) * 1000.0
         if result is None:

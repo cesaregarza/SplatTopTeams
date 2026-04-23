@@ -833,14 +833,25 @@ def _neighbors_by_query(
     query_semantic_vec: np.ndarray,
     query_identity_vec: np.ndarray,
     candidate_vectors: np.ndarray,
+    semantic_vectors: np.ndarray | None,
+    identity_vectors: np.ndarray | None,
     neighbors: int,
 ) -> List[Dict[str, Any]]:
+    query_vec = np.asarray(query_vec, dtype=candidate_vectors.dtype)
     sims = candidate_vectors @ query_vec
-    sem_vecs = np.stack([row.semantic_vector for row in embeddings], axis=0)
-    id_vecs = np.stack([row.identity_vector for row in embeddings], axis=0)
+    sem_vecs = (
+        semantic_vectors
+        if semantic_vectors is not None
+        else np.stack([row.semantic_vector for row in embeddings], axis=0)
+    )
+    id_vecs = (
+        identity_vectors
+        if identity_vectors is not None
+        else np.stack([row.identity_vector for row in embeddings], axis=0)
+    )
     excluded_ids = {int(team_id) for team_id in excluded_team_ids}
-    sem_sims = sem_vecs @ query_semantic_vec
-    id_sims = id_vecs @ query_identity_vec
+    sem_sims = sem_vecs @ np.asarray(query_semantic_vec, dtype=sem_vecs.dtype)
+    id_sims = id_vecs @ np.asarray(query_identity_vec, dtype=id_vecs.dtype)
 
     order = np.argsort(-sims)
     out: List[Dict[str, Any]] = []
@@ -875,6 +886,9 @@ def build_team_lab(
     neighbors: int,
     team_ids: Sequence[int] | None = None,
     team_name: str | None = None,
+    precomputed_finals: np.ndarray | None = None,
+    precomputed_semantics: np.ndarray | None = None,
+    precomputed_identities: np.ndarray | None = None,
 ) -> Dict[str, Any] | None:
     team_lookup = {row.team_id: row for row in embeddings}
     selected_team_ids = [int(team_id)]
@@ -938,7 +952,11 @@ def build_team_lab(
         for row in consolidated_rows
     ]
 
-    vectors = np.stack([row.final_vector for row in embeddings], axis=0)
+    vectors = (
+        precomputed_finals
+        if precomputed_finals is not None
+        else np.stack([row.final_vector for row in embeddings], axis=0)
+    )
     neighbors_out = _neighbors_by_query(
         excluded_team_ids=excluded_team_ids,
         embeddings=embeddings,
@@ -947,6 +965,8 @@ def build_team_lab(
         query_semantic_vec=target.semantic_vector,
         query_identity_vec=target.identity_vector,
         candidate_vectors=vectors,
+        semantic_vectors=precomputed_semantics,
+        identity_vectors=precomputed_identities,
         neighbors=neighbors,
     )
 
@@ -1107,6 +1127,8 @@ def build_blended_neighbors(
         query_semantic_vec=target.semantic_vector,
         query_identity_vec=target.identity_vector,
         candidate_vectors=blend_matrix,
+        semantic_vectors=sem_matrix,
+        identity_vectors=id_matrix,
         neighbors=neighbors,
     )
 
