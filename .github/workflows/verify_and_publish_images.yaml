@@ -93,9 +93,6 @@ jobs:
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Fetch registry credentials
         id: broker
         uses: cesaregarza/.github/actions/fetch-broker-credentials@main
@@ -104,38 +101,30 @@ jobs:
           audience: https://credentials.garz.ai/v1
           capability: digitalocean-registry-write
 
-      - name: Log in to DigitalOcean Container Registry
-        uses: docker/login-action@v3
+      - name: Set up DOCR Buildx
+        uses: cesaregarza/.github/actions/setup-docr-buildx@main
         with:
-          registry: registry.digitalocean.com
-          username: ${{ fromJson(steps.broker.outputs.secrets-json).DIGITALOCEAN_ACCESS_TOKEN }}
-          password: ${{ fromJson(steps.broker.outputs.secrets-json).DIGITALOCEAN_ACCESS_TOKEN }}
+          digitalocean-access-token: ${{ fromJson(steps.broker.outputs.secrets-json).DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Build and push teams API image
         id: api
-        uses: docker/build-push-action@v6
+        uses: cesaregarza/.github/actions/build-docr-image@main
         with:
           context: .
           file: dockerfiles/dockerfile.api
-          push: true
           tags: |
             registry.digitalocean.com/sendouq/teams-api:latest
             registry.digitalocean.com/sendouq/teams-api:v${{ steps.version.outputs.value }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Build and push teams frontend image
         id: frontend
-        uses: docker/build-push-action@v6
+        uses: cesaregarza/.github/actions/build-docr-image@main
         with:
           context: .
           file: dockerfiles/dockerfile.frontend
-          push: true
           tags: |
             registry.digitalocean.com/sendouq/teams-frontend:latest
             registry.digitalocean.com/sendouq/teams-frontend:v${{ steps.version.outputs.value }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Publish operator summary
         run: |
