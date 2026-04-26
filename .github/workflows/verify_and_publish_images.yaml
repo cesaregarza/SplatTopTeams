@@ -31,6 +31,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   packages: write
 
 concurrency:
@@ -95,12 +96,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Fetch registry credentials
+        id: broker
+        uses: cesaregarza/.github/actions/fetch-broker-credentials@main
+        with:
+          broker-url: https://credentials.garz.ai
+          audience: https://credentials.garz.ai/v1
+          capability: digitalocean-registry-write
+
       - name: Log in to DigitalOcean Container Registry
         uses: docker/login-action@v3
         with:
           registry: registry.digitalocean.com
-          username: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-          password: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          username: ${{ fromJson(steps.broker.outputs.secrets-json).DIGITALOCEAN_ACCESS_TOKEN }}
+          password: ${{ fromJson(steps.broker.outputs.secrets-json).DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Build and push teams API image
         id: api
