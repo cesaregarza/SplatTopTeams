@@ -5,7 +5,7 @@ This is the first-launch path for `SplatTopTeams` on `teams-int.splat.top`.
 ## Deployment shape
 
 - App repo: `SplatTopTeams`
-- Config repo: `SplatTopConfig`
+- Config repo: `GarzAICluster`
 - Argo application: `splattop-teams-prod`
 - Helm chart: `helm/splattop-teams`
 - Release hostname: `teams-int.splat.top`
@@ -18,7 +18,7 @@ Before the first sync:
 - `SplatTopTeams` `main` is green on:
   - `uv run pytest -q`
   - `cd frontend && npm run build`
-- `SplatTopConfig` validates the `splattop-teams` chart cleanly
+- `GarzAICluster` validates the `splattop-teams` chart cleanly
 - `db-secrets` exists in the target namespace and contains `RANKINGS_DATABASE_URL` or equivalent DB parts
 - the image pull secret referenced by `global.imagePullSecrets` exists and can read from `registry.digitalocean.com/sendouq`
 
@@ -27,7 +27,7 @@ Before the first sync:
 1. Merge the launch-ready app changes into `SplatTopTeams/main`.
 2. Run the `Verify and Publish Images` workflow or wait for the push workflow to finish.
 3. Copy the published tags from the workflow summary.
-4. Update `SplatTopConfig/helm/splattop-teams/values-prod.yaml`:
+4. Update `GarzAICluster/helm/splattop-teams/values-prod.yaml`:
    - `teamsApi.image.tag`
    - `teamsFrontend.image.tag`
    - `global.appImageTag` only if you want the same tag to remain the fallback default
@@ -101,7 +101,7 @@ kubectl -n default logs job/<bootstrap-job-name>
 
 If the deploy is bad:
 
-1. Revert the image tags in `SplatTopConfig/helm/splattop-teams/values-prod.yaml`
+1. Revert the image tags in `GarzAICluster/helm/splattop-teams/values-prod.yaml`
 2. Merge the revert
 3. Sync `splattop-teams-prod` again in Argo
 4. Confirm the two deployments rolled back successfully with `kubectl rollout status`

@@ -141,5 +141,5 @@ jobs:
             echo "- teams-api: \`${{ steps.api.outputs.digest }}\`"
             echo "- teams-frontend: \`${{ steps.frontend.outputs.digest }}\`"
             echo
-            echo "Update \`SplatTopConfig/helm/splattop-teams/values-prod.yaml\` with the new tags, merge that repo, then sync \`splattop-teams-prod\` in Argo."
+            echo "Update \`GarzAICluster/helm/splattop-teams/values-prod.yaml\` with the new tags, merge that repo, then sync \`splattop-teams-prod\` in Argo."
           } >> "$GITHUB_STEP_SUMMARY"
